@@ -80,24 +80,6 @@ pub fn shark_rows() -> Vec<String> {
         .collect()
 }
 
-/// Big Tiburoncín: each pixel is `██` (two cells ≈ a square), 44 columns × 22 rows.
-pub fn big_shark_rows() -> Vec<String> {
-    PIXELS
-        .iter()
-        .map(|line| {
-            let mut row = String::new();
-            for &c in line.as_bytes() {
-                match pixel(c) {
-                    Some(p) => write!(row, "{}██", fg(p)).unwrap(),
-                    None => row.push_str("\x1b[0m  "),
-                }
-            }
-            row.push_str(RESET);
-            row
-        })
-        .collect()
-}
-
 pub struct SysInfo {
     pub name: String,
     pub cpu: String,
@@ -273,9 +255,7 @@ pub fn info_lines(info: &SysInfo) -> Vec<String> {
 /// Banner as terminal bytes (CRLF line endings, since it bypasses the tty).
 pub fn banner(info: &SysInfo, cols: usize) -> String {
     let right = info_lines(info);
-    let (left, left_w) = if cols >= MARGIN + 44 + GAP + BOX_W {
-        (big_shark_rows(), 44)
-    } else if cols >= MARGIN + 22 + GAP + BOX_W {
+    let (left, left_w) = if cols >= MARGIN + 22 + GAP + BOX_W {
         (shark_rows(), 22)
     } else {
         (vec![], 0)
@@ -408,13 +388,6 @@ mod tests {
     }
 
     #[test]
-    fn big_shark_is_44_by_22() {
-        let rows = big_shark_rows();
-        assert_eq!(rows.len(), 22);
-        assert!(rows.iter().all(|r| visible(r) == 44));
-    }
-
-    #[test]
     fn opaque_pairs_use_upper_half_block() {
         let row = &shark_rows()[6]; // rows 12+13
         assert!(row.contains("\x1b[38;2;62;124;177m\x1b[48;2;62;124;177m▀"));
@@ -452,10 +425,8 @@ mod tests {
     #[test]
     fn layout_degrades_with_width() {
         let info = SysInfo::read(Some("Test"), "Font", None);
-        assert!(banner(&info, 120).contains("██"));
-        let mid = banner(&info, 80);
-        assert!(mid.contains('▀') && !mid.contains("██"));
-        assert!(!banner(&info, 40).contains('▀'));
+        assert!(banner(&info, 80).contains('▀'));
+        assert!(!banner(&info, 60).contains('▀'));
     }
 
     #[test]

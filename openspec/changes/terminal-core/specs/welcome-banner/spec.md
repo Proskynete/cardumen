@@ -12,11 +12,7 @@ When a session starts, the system SHALL write a welcome banner into the terminal
 - **THEN** no banner is printed
 
 ### Requirement: Tiburoncín drawing
-The banner SHALL draw Tiburoncín from the 22×22 pixel grid (`k` outline `#1A3A57`, `b` body `#3E7CB1`, `w` foam `#EDF4F3`, `r` tongue `#F4736B`, `.` transparent). When the window is at least 98 columns wide, each pixel SHALL be `██` in truecolor (44 columns × 22 rows). When it is 74–97 columns wide, the drawing SHALL use upper half-blocks `▀` (22 columns × 11 rows). Below 74 columns, no drawing is shown. Block elements `▀ ▄ █` SHALL be rendered as exact rectangles, without seams between rows.
-
-#### Scenario: Wide window
-- **WHEN** the window has 120 columns
-- **THEN** Tiburoncín is drawn with `██` per pixel, 44 columns × 22 rows
+The banner SHALL draw Tiburoncín from the 22×22 pixel grid (`k` outline `#1A3A57`, `b` body `#3E7CB1`, `w` foam `#EDF4F3`, `r` tongue `#F4736B`, `.` transparent). The drawing SHALL use upper half-blocks `▀` (22 columns × 11 rows), the same size as on eduardoalvarez.dev, vertically centred next to the info boxes. Below 74 columns, no drawing is shown. Block elements `▀ ▄ █` SHALL be rendered as exact rectangles, without seams between rows.
 
 #### Scenario: Pixel mapping in half-blocks
 - **WHEN** the window has 80 columns and a cell covers a `b` pixel on top and a `k` pixel below
