@@ -7,9 +7,10 @@ Stack: winit + wgpu (Metal) + `alacritty_terminal` + cosmic-text.
 ## Build and run
 
 ```sh
-cargo build --release
-./target/release/cardumen
+scripts/bundle.sh --install   # builds Cardumen.app and installs it in /Applications
 ```
+
+Or, for development: `cargo run --release`.
 
 Requires Rust (stable) and, for the default font, `FiraCode Nerd Font Mono` (it falls back to Menlo when the font is missing).
 

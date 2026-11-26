@@ -53,8 +53,32 @@ pub struct Session<L: EventListener = Listener> {
     pid: u32,
 }
 
+/// `$SHELL`, else the login shell from the user database (apps opened from
+/// Finder may not inherit `SHELL`), else `/bin/zsh`.
 pub fn shell_program() -> String {
-    std::env::var("SHELL").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "/bin/zsh".into())
+    pick_shell(std::env::var("SHELL").ok(), passwd_shell())
+}
+
+fn pick_shell(env: Option<String>, passwd: Option<String>) -> String {
+    env.filter(|s| !s.is_empty())
+        .or(passwd.filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| "/bin/zsh".into())
+}
+
+fn passwd_shell() -> Option<String> {
+    // SAFETY: getpwuid returns static storage or null; we copy the string out immediately.
+    unsafe {
+        let pw = libc::getpwuid(libc::getuid());
+        if pw.is_null() || (*pw).pw_shell.is_null() {
+            return None;
+        }
+        Some(std::ffi::CStr::from_ptr((*pw).pw_shell).to_string_lossy().into_owned())
+    }
+}
+
+/// Apps launched from the Dock get no locale; without one zsh mangles UTF-8.
+fn needs_lang(vars: &[Option<String>]) -> bool {
+    vars.iter().all(|v| v.as_deref().is_none_or(str::is_empty))
 }
 
 impl<L: EventListener + Clone + Send + 'static> Session<L> {
@@ -65,11 +89,15 @@ impl<L: EventListener + Clone + Send + 'static> Session<L> {
         banner: Option<String>,
         cwd: Option<PathBuf>,
     ) -> std::io::Result<Self> {
-        let env = HashMap::from([
+        let mut env = HashMap::from([
             ("TERM".to_string(), "xterm-256color".to_string()),
             ("COLORTERM".to_string(), "truecolor".to_string()),
             ("TERM_PROGRAM".to_string(), "cardumen".to_string()),
         ]);
+        let locale = ["LANG", "LC_ALL", "LC_CTYPE"].map(|k| std::env::var(k).ok());
+        if needs_lang(&locale) {
+            env.insert("LANG".into(), "en_US.UTF-8".into());
+        }
         let options = tty::Options {
             shell: Some(tty::Shell::new(shell_program(), vec!["-l".into()])),
             working_directory: cwd.or_else(|| std::env::var_os("HOME").map(Into::into)),
@@ -182,6 +210,15 @@ mod tests {
     /// Wait until the login shell is interactive (zsh enables bracketed paste at its prompt).
     fn ready(s: &Session<Probe>) {
         wait("prompt", 15, || s.term.lock().mode().contains(TermMode::BRACKETED_PASTE));
+    }
+
+    #[test]
+    fn shell_and_locale_fallbacks() {
+        assert_eq!(pick_shell(Some("/bin/bash".into()), Some("/bin/zsh".into())), "/bin/bash");
+        assert_eq!(pick_shell(Some(String::new()), Some("/opt/homebrew/bin/fish".into())), "/opt/homebrew/bin/fish");
+        assert_eq!(pick_shell(None, None), "/bin/zsh");
+        assert!(needs_lang(&[None, Some(String::new()), None]));
+        assert!(!needs_lang(&[None, None, Some("UTF-8".into())]));
     }
 
     #[test]
