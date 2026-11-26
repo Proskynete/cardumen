@@ -5,6 +5,7 @@ mod input;
 mod layout;
 mod renderer;
 mod session;
+mod session_file;
 mod status;
 mod theme;
 mod usage;
@@ -65,6 +66,8 @@ const SUCCESS: Rgb = [0x4F, 0xB4, 0x77];
 
 const BLINK: Duration = Duration::from_millis(530);
 const MULTI_CLICK: Duration = Duration::from_millis(400);
+/// Quiet time after a structural change before the session file is written.
+const SAVE_DELAY: Duration = Duration::from_secs(1);
 
 struct Pane {
     session: Session,
@@ -135,6 +138,9 @@ struct State {
     footer_hover: bool,
     ui_hits: Vec<(Rect, UiHit)>,
     ctx_tx: std::sync::mpsc::Sender<context::Request>,
+    /// Last seen structure (without directories) and when to save it.
+    saved_shape: Option<session_file::Saved>,
+    save_at: Option<Instant>,
 }
 
 struct TabDrag {
@@ -1301,6 +1307,54 @@ impl State {
         }
     }
 
+    /// Window structure for the session file; directories only when `with_cwd`
+    /// (reading them is a syscall per pane).
+    fn snapshot(&self, with_cwd: bool) -> session_file::Saved {
+        let cwd = |id: PaneId| if with_cwd { self.panes.get(&id).and_then(|p| p.session.cwd()) } else { None };
+        session_file::capture(&self.tabs, cwd, self.sidebar, self.panel)
+    }
+
+    fn save_session(&self) {
+        let Some(path) = session_file::path() else { return };
+        if let Err(e) = session_file::store(&path, &self.snapshot(true)) {
+            eprintln!("cardumen: cannot save session to {}: {e}", path.display());
+        }
+    }
+
+    /// Rebuild the saved tabs, one new shell per pane. False when there was
+    /// nothing usable to restore.
+    fn restore_session(&mut self) -> bool {
+        let Some(saved) = session_file::path().and_then(|p| session_file::load(&p)) else { return false };
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let (tabs, panes) = session_file::rebuild(&saved, &mut self.next_id, home.as_deref());
+        if tabs.list.is_empty() {
+            return false;
+        }
+        // Flags first: pane grids are sized from the final content rect.
+        self.sidebar = saved.sidebar;
+        self.panel = saved.panel;
+        let active_id = tabs.active().id;
+        self.tabs = tabs;
+        let mut banner = true;
+        for (id, cwd) in panes {
+            // spawn_pane lays out the active tab, so visit each pane's tab.
+            let Some(t) = self.tabs.list.iter().position(|t| t.root.contains(id)) else { continue };
+            self.tabs.active = t;
+            if self.spawn_pane(id, banner, cwd) {
+                banner = false;
+            } else {
+                self.tabs.remove_pane(id);
+            }
+        }
+        if self.tabs.list.is_empty() {
+            return false;
+        }
+        let active = self.tabs.list.iter().position(|t| t.id == active_id);
+        self.tabs.active = active.unwrap_or(self.tabs.active).min(self.tabs.list.len() - 1);
+        self.relayout();
+        true
+    }
+
     fn after_tab_change(&mut self) {
         self.reset_blink();
         self.update_title();
@@ -1366,8 +1420,12 @@ impl ApplicationHandler<UserEvent> for App {
                 let proxy = self.proxy.clone();
                 context::spawn(move |u| proxy.send_event(UserEvent::Context(u)).is_ok(), session::cwd_of)
             },
+            saved_shape: None,
+            save_at: None,
         };
-        st.new_tab();
+        if !st.restore_session() {
+            st.new_tab();
+        }
         if st.tabs.list.is_empty() {
             event_loop.exit();
             return;
@@ -1775,9 +1833,20 @@ impl ApplicationHandler<UserEvent> for App {
                 st.window.request_redraw();
             }
         }
+        // Any structural change (tabs, splits, names, focus, sidebar/panel) schedules a save.
+        let shape = st.snapshot(false);
+        if st.saved_shape.as_ref() != Some(&shape) {
+            st.saved_shape = Some(shape);
+            st.save_at = Some(now + SAVE_DELAY);
+        }
+        if st.save_at.is_some_and(|t| now >= t) {
+            st.save_at = None;
+            st.save_session();
+        }
+        let next_tick = st.save_at.map_or(st.next_tick, |t| t.min(st.next_tick));
         if !blinking {
             st.cursor_on = true;
-            event_loop.set_control_flow(ControlFlow::WaitUntil(st.next_tick));
+            event_loop.set_control_flow(ControlFlow::WaitUntil(next_tick));
             return;
         }
         if Instant::now() >= st.next_blink {
@@ -1785,7 +1854,14 @@ impl ApplicationHandler<UserEvent> for App {
             st.next_blink = Instant::now() + BLINK;
             st.window.request_redraw();
         }
-        event_loop.set_control_flow(ControlFlow::WaitUntil(st.next_blink.min(st.next_tick)));
+        event_loop.set_control_flow(ControlFlow::WaitUntil(st.next_blink.min(next_tick)));
+    }
+
+    /// Cmd+Q, window close, or the last tab closed (which deletes the file).
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        if let Some(st) = self.state.as_ref() {
+            st.save_session();
+        }
     }
 }
 
