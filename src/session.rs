@@ -44,8 +44,8 @@ impl Dimensions for GridSize {
     }
 }
 
-pub struct Session {
-    pub term: Arc<FairMutex<Term<Listener>>>,
+pub struct Session<L: EventListener = Listener> {
+    pub term: Arc<FairMutex<Term<L>>>,
     sender: EventLoopSender,
 }
 
@@ -53,8 +53,8 @@ pub fn shell_program() -> String {
     std::env::var("SHELL").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "/bin/zsh".into())
 }
 
-impl Session {
-    pub fn spawn(size: WindowSize, scrollback: usize, listener: Listener, banner: Option<String>) -> std::io::Result<Self> {
+impl<L: EventListener + Clone + Send + 'static> Session<L> {
+    pub fn spawn(size: WindowSize, scrollback: usize, listener: L, banner: Option<String>) -> std::io::Result<Self> {
         let env = HashMap::from([
             ("TERM".to_string(), "xterm-256color".to_string()),
             ("COLORTERM".to_string(), "truecolor".to_string()),
@@ -90,8 +90,139 @@ impl Session {
     }
 }
 
-impl Drop for Session {
+impl<L: EventListener> Drop for Session<L> {
     fn drop(&mut self) {
         let _ = self.sender.send(Msg::Shutdown);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alacritty_terminal::term::TermMode;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    #[derive(Clone)]
+    struct Probe(mpsc::Sender<String>);
+    impl EventListener for Probe {
+        fn send_event(&self, e: Event) {
+            let name = match e {
+                Event::Exit => "exit",
+                Event::ChildExit(_) => "child-exit",
+                _ => return,
+            };
+            let _ = self.0.send(name.into());
+        }
+    }
+
+    fn size(cols: u16, lines: u16) -> WindowSize {
+        WindowSize { num_cols: cols, num_lines: lines, cell_width: 8, cell_height: 16 }
+    }
+
+    fn start(cols: u16) -> (Session<Probe>, mpsc::Receiver<String>) {
+        let (tx, rx) = mpsc::channel();
+        let s = Session::spawn(size(cols, 24), 1000, Probe(tx), Some("BANNER\r\n".into())).unwrap();
+        (s, rx)
+    }
+
+    fn screen(s: &Session<Probe>) -> String {
+        let term = s.term.lock();
+        let mut out = String::new();
+        let mut last = None;
+        for cell in term.grid().display_iter() {
+            if last.is_some_and(|l| l != cell.point.line) {
+                out.push('\n');
+            }
+            last = Some(cell.point.line);
+            out.push(cell.c);
+        }
+        out
+    }
+
+    fn wait(what: &str, timeout: u64, mut ok: impl FnMut() -> bool) {
+        let end = Instant::now() + Duration::from_secs(timeout);
+        while !ok() {
+            assert!(Instant::now() < end, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Wait until the login shell is interactive (zsh enables bracketed paste at its prompt).
+    fn ready(s: &Session<Probe>) {
+        wait("prompt", 15, || s.term.lock().mode().contains(TermMode::BRACKETED_PASTE));
+    }
+
+    #[test]
+    fn banner_then_shell_output() {
+        let (s, _rx) = start(80);
+        assert!(screen(&s).starts_with("BANNER"));
+        ready(&s);
+        s.write(b"echo cardumen-$((40+2))\r".to_vec());
+        wait("echo output", 10, || screen(&s).contains("cardumen-42"));
+    }
+
+    #[test]
+    fn vim_uses_alternate_screen_and_restores() {
+        let (s, _rx) = start(80);
+        ready(&s);
+        s.write(b"vim -u NONE -N\r".to_vec());
+        wait("vim alt screen", 10, || s.term.lock().mode().contains(TermMode::ALT_SCREEN));
+        s.write(b"\x1b:q!\r".to_vec());
+        wait("vim exit", 10, || !s.term.lock().mode().contains(TermMode::ALT_SCREEN));
+    }
+
+    #[test]
+    fn resize_reaches_the_shell() {
+        let (s, _rx) = start(80);
+        ready(&s);
+        s.resize(size(57, 20));
+        s.write(b"echo cols=$(tput cols)\r".to_vec());
+        wait("tput cols", 10, || screen(&s).contains("cols=57"));
+    }
+
+    #[test]
+    fn scrollback_keeps_history() {
+        let (s, _rx) = start(80);
+        ready(&s);
+        s.write(b"for i in {1..200}; do echo line$i; done\r".to_vec());
+        wait("output", 10, || screen(&s).contains("line200"));
+        let term = s.term.lock();
+        assert!(term.grid().history_size() > 150, "history {}", term.grid().history_size());
+    }
+
+    #[test]
+    fn ctrl_c_interrupts() {
+        let (s, _rx) = start(80);
+        ready(&s);
+        s.write(b"sleep 30\r".to_vec());
+        std::thread::sleep(Duration::from_millis(300));
+        s.write(vec![3u8]);
+        s.write(b"echo after-int\r".to_vec());
+        wait("prompt after ^C", 5, || screen(&s).contains("after-int"));
+    }
+
+    #[test]
+    fn exit_ends_session() {
+        let (s, rx) = start(80);
+        ready(&s);
+        s.write(b"exit\r".to_vec());
+        let ev = rx.recv_timeout(Duration::from_secs(10)).expect("exit event");
+        assert!(ev == "exit" || ev == "child-exit", "{ev}");
+    }
+
+    #[test]
+    fn claude_code_starts() {
+        if std::process::Command::new("which").arg("claude").output().map_or(true, |o| !o.status.success()) {
+            return;
+        }
+        let (s, _rx) = start(100);
+        ready(&s);
+        s.write(b"claude\r".to_vec());
+        // Its UI (or the folder-trust prompt) names "Claude"; quit with two ^C.
+        wait("claude UI", 30, || screen(&s).contains("Claude"));
+        s.write(vec![3u8]);
+        std::thread::sleep(Duration::from_millis(200));
+        s.write(vec![3u8]);
     }
 }
