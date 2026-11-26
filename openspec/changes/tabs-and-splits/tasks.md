@@ -20,7 +20,11 @@
 - [x] 4.1 Shortcuts: Cmd+T/W/1–9/Shift+[ ]/D/Shift+D/Option+Arrows
 - [x] 4.2 Mouse: click focuses a pane; selection, wheel and mouse reporting go to the pane under the pointer; tab clicks; drag the window from the empty band
 
-## 5. Verify
+## 5. Rename
+
+- [x] 5.0 Rename tabs inline: double-click or Cmd+Shift+R; Enter/click saves, Esc cancels, empty restores the automatic title
+
+## 6. Verify
 
 - [ ] 5.1 Tests pass; screenshot with 3 tabs and a nested split
 - [x] 5.2 Memory with 5 tabs, recorded in the README

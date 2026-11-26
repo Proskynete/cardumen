@@ -121,6 +121,33 @@ fn encode_named(key: NamedKey, mods: ModifiersState, app_cursor: bool) -> Option
     })
 }
 
+pub enum Edit {
+    Continue,
+    Commit,
+    Cancel,
+}
+
+/// Line editing for the tab-rename field.
+pub fn edit_line(buf: &mut String, key: &Key, text: Option<&str>, mods: ModifiersState) -> Edit {
+    match key {
+        Key::Named(NamedKey::Enter) => Edit::Commit,
+        Key::Named(NamedKey::Escape) => Edit::Cancel,
+        Key::Named(NamedKey::Backspace) if mods.super_key() => {
+            buf.clear();
+            Edit::Continue
+        }
+        Key::Named(NamedKey::Backspace) => {
+            buf.pop();
+            Edit::Continue
+        }
+        _ if mods.super_key() || mods.control_key() => Edit::Continue,
+        _ => {
+            buf.extend(text.unwrap_or("").chars().filter(|c| !c.is_control()));
+            Edit::Continue
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,5 +191,21 @@ mod tests {
         assert_eq!(named(NamedKey::Tab, ModifiersState::SHIFT, false), b"\x1b[Z");
         assert_eq!(named(NamedKey::Delete, ModifiersState::CONTROL, false), b"\x1b[3;5~");
         assert_eq!(named(NamedKey::F5, ModifiersState::empty(), false), b"\x1b[15~");
+    }
+
+    #[test]
+    fn rename_editing() {
+        let mut b = String::from("ab");
+        let none = ModifiersState::empty();
+        assert!(matches!(edit_line(&mut b, &ch("c"), Some("c"), none), Edit::Continue));
+        assert_eq!(b, "abc");
+        edit_line(&mut b, &Key::Named(NamedKey::Backspace), None, none);
+        assert_eq!(b, "ab");
+        edit_line(&mut b, &ch("x"), Some("x"), ModifiersState::CONTROL);
+        assert_eq!(b, "ab");
+        edit_line(&mut b, &Key::Named(NamedKey::Backspace), None, ModifiersState::SUPER);
+        assert_eq!(b, "");
+        assert!(matches!(edit_line(&mut b, &Key::Named(NamedKey::Enter), None, none), Edit::Commit));
+        assert!(matches!(edit_line(&mut b, &Key::Named(NamedKey::Escape), None, none), Edit::Cancel));
     }
 }

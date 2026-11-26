@@ -82,6 +82,9 @@ struct State {
     last_click: Option<(Instant, Point, u8)>,
     scroll_px: f64,
     pressed_button: Option<(PaneId, u8)>,
+    /// Tab being renamed and its edit buffer.
+    renaming: Option<(usize, String)>,
+    last_tab_click: Option<(Instant, usize)>,
 }
 
 struct App {
@@ -214,6 +217,7 @@ impl State {
         if self.panes.remove(&id).is_none() {
             return self.tabs.list.is_empty();
         }
+        self.renaming = None;
         self.tabs.remove_pane(id);
         if self.tabs.list.is_empty() {
             return true;
@@ -224,6 +228,9 @@ impl State {
     }
 
     fn tab_title(&self, i: usize) -> String {
+        if let Some(name) = &self.tabs.list[i].name {
+            return name.clone();
+        }
         let Some(pane) = self.panes.get(&self.tabs.list[i].focused) else { return String::new() };
         // Shell prompts set "user@host: path" on every tab; the folder name says more.
         let user_prefix = format!("{}@", std::env::var("USER").unwrap_or_default());
@@ -270,12 +277,22 @@ impl State {
                     color: theme::ACCENT,
                 });
             }
+            let max_w = rect.w - 2.0 * TAB_PAD * s;
+            let (text, editing) = match &self.renaming {
+                Some((j, buf)) if *j == i => (buf.clone(), true),
+                _ => (self.tab_title(i), false),
+            };
+            if editing {
+                // Caret after the text (clamped to the tab), in the accent colour.
+                let caret_x = x + TAB_PAD * s + (text.chars().count() as f32 * cw).min(max_w);
+                out.push(Chrome::Rect { rect: Rect { x: caret_x, y: text_y, w: 2.0 * s, h: ch }, color: theme::ACCENT });
+            }
             out.push(Chrome::Text {
                 x: x + TAB_PAD * s,
                 y: text_y,
-                text: self.tab_title(i),
+                text,
                 color: if active { theme::FOREGROUND } else { theme::MUTED },
-                max_w: rect.w - 2.0 * TAB_PAD * s,
+                max_w,
             });
             self.tab_hits.push((rect, TabHit::Tab(i)));
         }
@@ -454,6 +471,7 @@ impl State {
                 }
             }
             "d" => self.split(if m.shift_key() { Dir::Down } else { Dir::Right }),
+            "r" if m.shift_key() => self.start_rename(self.tabs.active),
             "=" | "+" => self.set_font_size(self.font_points + 1.0),
             "-" => self.set_font_size(self.font_points - 1.0),
             "0" => self.set_font_size(self.config.font.size),
@@ -468,6 +486,26 @@ impl State {
             _ => return false,
         }
         true
+    }
+
+    fn start_rename(&mut self, i: usize) {
+        self.commit_rename();
+        self.tabs.select(i);
+        let current = self.tabs.list[i].name.clone().unwrap_or_else(|| self.tab_title(i));
+        self.renaming = Some((i, current));
+        self.window.request_redraw();
+    }
+
+    /// Save the edited name; an empty name goes back to the automatic title.
+    fn commit_rename(&mut self) {
+        if let Some((i, name)) = self.renaming.take() {
+            if let Some(tab) = self.tabs.list.get_mut(i) {
+                let name = name.trim();
+                tab.name = (!name.is_empty()).then(|| name.to_string());
+            }
+            self.update_title();
+            self.window.request_redraw();
+        }
     }
 
     fn after_tab_change(&mut self) {
@@ -512,6 +550,8 @@ impl ApplicationHandler<UserEvent> for App {
             last_click: None,
             scroll_px: 0.0,
             pressed_button: None,
+            renaming: None,
+            last_tab_click: None,
         };
         st.new_tab();
         if st.tabs.list.is_empty() {
@@ -596,6 +636,17 @@ impl ApplicationHandler<UserEvent> for App {
                 st.window.request_redraw();
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+                if let Some((_, buf)) = st.renaming.as_mut() {
+                    match input::edit_line(buf, &event.logical_key, event.text.as_deref(), st.mods) {
+                        input::Edit::Continue => st.window.request_redraw(),
+                        input::Edit::Commit => st.commit_rename(),
+                        input::Edit::Cancel => {
+                            st.renaming = None;
+                            st.window.request_redraw();
+                        }
+                    }
+                    return;
+                }
                 let plain = event.key_without_modifiers();
                 if st.shortcut(&event.logical_key, &plain, event.physical_key, event_loop) {
                     return;
@@ -634,8 +685,17 @@ impl ApplicationHandler<UserEvent> for App {
                 if pressed && button == MouseButton::Left && y < BAR_H * st.scale() {
                     match st.tab_hits.iter().find(|(r, _)| r.contains(x, y)).map(|(_, h)| h) {
                         Some(TabHit::Tab(i)) => {
-                            st.tabs.select(*i);
-                            st.after_tab_change();
+                            let i = *i;
+                            let now = Instant::now();
+                            let double = st.last_tab_click.is_some_and(|(t, j)| j == i && now - t < MULTI_CLICK);
+                            st.last_tab_click = Some((now, i));
+                            if double {
+                                st.start_rename(i);
+                            } else if st.renaming.as_ref().is_none_or(|(j, _)| *j != i) {
+                                st.commit_rename();
+                                st.tabs.select(i);
+                                st.after_tab_change();
+                            }
                         }
                         Some(TabHit::New) => st.new_tab(),
                         None => {
@@ -643,6 +703,9 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                     }
                     return;
+                }
+                if pressed {
+                    st.commit_rename();
                 }
                 if !pressed {
                     // Copy on select: whatever was just selected goes to the clipboard.

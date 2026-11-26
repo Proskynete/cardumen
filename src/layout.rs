@@ -136,6 +136,8 @@ pub fn neighbour(rects: &[(PaneId, Rect)], from: PaneId, arrow: Arrow) -> Option
 pub struct Tab {
     pub root: Node,
     pub focused: PaneId,
+    /// Name set by the user; wins over any automatic title.
+    pub name: Option<String>,
 }
 
 #[derive(Default)]
@@ -156,7 +158,7 @@ impl Tabs {
     /// Insert a one-pane tab after the active one and select it.
     pub fn open(&mut self, pane: PaneId) {
         let at = if self.list.is_empty() { 0 } else { self.active + 1 };
-        self.list.insert(at, Tab { root: Node::Leaf(pane), focused: pane });
+        self.list.insert(at, Tab { root: Node::Leaf(pane), focused: pane, name: None });
         self.active = at;
     }
 

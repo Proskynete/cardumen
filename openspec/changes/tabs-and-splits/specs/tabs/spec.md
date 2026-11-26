@@ -38,3 +38,18 @@ When the last pane of a tab closes (Cmd+W or shell exit), the tab SHALL close an
 #### Scenario: Close middle tab
 - **WHEN** tabs A, B, C are open, B is active and its only shell exits
 - **THEN** B is removed and A becomes active
+
+### Requirement: Rename tab
+Double-clicking a tab, or pressing Cmd+Shift+R on the active tab, SHALL turn its title into an inline text field with an accent caret, prefilled with the current title. While editing, keystrokes SHALL go to the field and not to the shell: Enter or a click elsewhere SHALL save, Escape SHALL cancel, Backspace SHALL delete a character and Cmd+Backspace SHALL clear the field. A saved name SHALL replace any automatic title (OSC or directory) until it is renamed again. Saving an empty name SHALL restore the automatic title.
+
+#### Scenario: Name a tab
+- **WHEN** the user double-clicks a tab, types "api" and presses Enter
+- **THEN** the tab shows "api", even after Claude Code sets a window title
+
+#### Scenario: Clear the name
+- **WHEN** the user renames a tab to an empty string
+- **THEN** the tab goes back to showing the directory or program title
+
+#### Scenario: Cancel
+- **WHEN** the user presses Escape while renaming
+- **THEN** the tab keeps its previous title and the shell received no keystrokes
