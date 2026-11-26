@@ -42,6 +42,7 @@ size = 14.0
 | Cmd+Shift+[ / ], Ctrl+Tab | previous / next tab |
 | Cmd+D / Cmd+Shift+D | split right / split down |
 | Cmd+Option+Arrows | focus the pane in that direction |
+| Cmd+B | show / hide the session sidebar |
 | Cmd+Q | quit |
 | Option+←/→ | word left/right (`ESC b` / `ESC f`) |
 | Cmd+←/→, Cmd+⌫ | line start/end, delete line |
@@ -51,6 +52,14 @@ size = 14.0
 - Memory: 39 MB `phys_footprint` (from `footprint`)
 - Memory with 3 tabs and 5 shells: 44 MB
 - Idle CPU: 0.0%
+
+## Claude Code session states
+
+The sidebar shows each Claude Code session as working, waiting for you, or done. It needs hooks in `~/.claude/settings.json` (installed once, with a backup; they do nothing outside Cardumen):
+
+```sh
+scripts/install-hooks.py
+```
 
 ## Specs
 

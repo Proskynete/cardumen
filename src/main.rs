@@ -4,6 +4,7 @@ mod input;
 mod layout;
 mod renderer;
 mod session;
+mod status;
 mod theme;
 mod welcome;
 
@@ -45,6 +46,10 @@ const PAD: f32 = 8.0;
 const DIVIDER: f32 = 1.0;
 
 const HAIRLINE: Rgb = [0x1F, 0x33, 0x3D];
+const SIDEBAR_W: f32 = 230.0;
+const SIDEBAR_BG: Rgb = [0x0C, 0x17, 0x1D];
+const WARM: Rgb = [0xF2, 0xA6, 0x5A];
+const SUCCESS: Rgb = [0x4F, 0xB4, 0x77];
 const TAB_BG: Rgb = [0x0F, 0x1F, 0x27];
 
 const BLINK: Duration = Duration::from_millis(530);
@@ -54,6 +59,7 @@ struct Pane {
     session: Session,
     title: Option<String>,
     rect: Rect,
+    claude: Option<status::State>,
 }
 
 enum TabHit {
@@ -92,6 +98,10 @@ struct State {
     animating: bool,
     hovered_tab: Option<usize>,
     tab_w: f32,
+    socket: PathBuf,
+    sidebar: bool,
+    sidebar_hits: Vec<(Rect, PaneId)>,
+    next_tick: Instant,
 }
 
 struct TabDrag {
@@ -103,6 +113,7 @@ struct TabDrag {
 }
 
 struct App {
+    socket: PathBuf,
     config: Config,
     proxy: EventLoopProxy<UserEvent>,
     state: Option<State>,
@@ -113,10 +124,20 @@ impl State {
         self.window.scale_factor() as f32
     }
 
+    fn sidebar_w(&self) -> f32 {
+        if self.sidebar { SIDEBAR_W * self.scale() } else { 0.0 }
+    }
+
     fn content_rect(&self) -> Rect {
         let size = self.window.inner_size();
-        let top = BAR_H * self.scale();
-        Rect { x: 0.0, y: top, w: size.width as f32, h: (size.height as f32 - top).max(1.0) }
+        let (top, left) = (BAR_H * self.scale(), self.sidebar_w());
+        Rect { x: left, y: top, w: (size.width as f32 - left).max(1.0), h: (size.height as f32 - top).max(1.0) }
+    }
+
+    /// Where the first tab starts: after the traffic lights, or after the sidebar.
+    fn tabs_x(&self) -> f32 {
+        let s = self.scale();
+        if self.sidebar { self.sidebar_w() + 8.0 * s } else { TABS_X * s }
     }
 
     fn grid_size(&self, r: Rect) -> WindowSize {
@@ -185,9 +206,13 @@ impl State {
             let info = welcome::SysInfo::read(self.config.user_name.as_deref(), &font, display);
             welcome::banner(&info, size.num_cols as usize)
         });
-        match Session::spawn(size, self.config.scrollback, Listener(self.proxy.clone(), id), banner, cwd) {
+        let env = vec![
+            ("CARDUMEN_SOCKET".to_string(), self.socket.to_string_lossy().into_owned()),
+            ("CARDUMEN_PANE".to_string(), id.to_string()),
+        ];
+        match Session::spawn(size, self.config.scrollback, Listener(self.proxy.clone(), id), banner, cwd, env) {
             Ok(session) => {
-                self.panes.insert(id, Pane { session, title: None, rect });
+                self.panes.insert(id, Pane { session, title: None, rect, claude: None });
                 true
             }
             Err(e) => {
@@ -270,6 +295,108 @@ impl State {
         }
     }
 
+    /// A pane's own label: its program title (not the shell's user@host), else its folder.
+    fn pane_label(&self, id: PaneId) -> String {
+        let Some(pane) = self.panes.get(&id) else { return String::new() };
+        let user_prefix = format!("{}@", std::env::var("USER").unwrap_or_default());
+        if let Some(t) = pane.title.as_deref().filter(|t| !t.is_empty() && !t.starts_with(&user_prefix)) {
+            return t.to_string();
+        }
+        folder_name(pane.session.cwd())
+    }
+
+    fn tab_waiting(&self, i: usize) -> bool {
+        self.tabs.list[i]
+            .root
+            .leaves()
+            .iter()
+            .any(|id| self.panes.get(id).and_then(|p| p.claude).is_some_and(|c| c.claude == status::Claude::Waiting))
+    }
+
+    /// Sidebar: summary line, then panes grouped by project with their Claude state.
+    fn sidebar_chrome(&mut self, out: &mut Vec<Chrome>) {
+        self.sidebar_hits.clear();
+        if !self.sidebar {
+            return;
+        }
+        let s = self.scale();
+        let (cw, ch) = (self.fonts.cell_w, self.fonts.cell_h);
+        let (w, height) = (self.sidebar_w(), self.window.inner_size().height as f32);
+        out.push(Chrome::Rect { rect: Rect { x: 0.0, y: 0.0, w, h: height }, color: SIDEBAR_BG });
+        out.push(Chrome::Rect { rect: Rect { x: w - s, y: 0.0, w: s, h: height }, color: HAIRLINE });
+        let left = 14.0 * s;
+        let text_w = w - 2.0 * left;
+        let line = ch + 4.0 * s;
+
+        // (project, pane id, tab index) in tab order, grouped by first appearance.
+        let mut groups: Vec<(String, Vec<(PaneId, usize)>)> = vec![];
+        for (i, tab) in self.tabs.list.iter().enumerate() {
+            for id in tab.root.leaves() {
+                let project = project_name(self.panes.get(&id).and_then(|p| p.session.cwd()));
+                match groups.iter_mut().find(|(p, _)| *p == project) {
+                    Some((_, rows)) => rows.push((id, i)),
+                    None => groups.push((project, vec![(id, i)])),
+                }
+            }
+        }
+        let count = |c: status::Claude| self.panes.values().filter(|p| p.claude.is_some_and(|x| x.claude == c)).count();
+        let (waiting, working) = (count(status::Claude::Waiting), count(status::Claude::Working));
+
+        let mut y = BAR_H * s + 6.0 * s;
+        let first = format!("● {waiting} espera");
+        let second_x = left + (first.chars().count() + 2) as f32 * cw;
+        out.push(Chrome::Text { x: left, y, text: first, color: if waiting > 0 { WARM } else { theme::MUTED }, max_w: text_w });
+        out.push(Chrome::Text {
+            x: second_x,
+            y,
+            text: format!("● {working} trabaja"),
+            color: if working > 0 { theme::ACCENT } else { theme::MUTED },
+            max_w: left + text_w - second_x,
+        });
+        y += line + 10.0 * s;
+
+        let focused = self.focused_id();
+        for (project, rows) in groups {
+            if y > height {
+                break;
+            }
+            out.push(Chrome::Text { x: left, y, text: project, color: theme::MUTED, max_w: text_w });
+            y += line;
+            for (id, tab) in rows {
+                let row = Rect { x: 6.0 * s, y: y - 3.0 * s, w: w - 12.0 * s, h: 2.0 * line + 2.0 * s };
+                if id == focused {
+                    out.push(Chrome::Rect { rect: row, color: TAB_BG });
+                }
+                let state = self.panes.get(&id).and_then(|p| p.claude);
+                let (dot, detail) = match state {
+                    Some(st) => match st.claude {
+                        status::Claude::Waiting => (WARM, format!("te espera · {}", status::elapsed(st.since))),
+                        status::Claude::Working => (theme::ACCENT, format!("trabajando · {}", status::elapsed(st.since))),
+                        status::Claude::Done => (SUCCESS, format!("lista · {}", status::elapsed(st.since))),
+                    },
+                    None => (theme::MUTED, folder_name(self.panes.get(&id).and_then(|p| p.session.cwd()))),
+                };
+                let label = self.tabs.list[tab].name.clone().unwrap_or_else(|| self.pane_label(id));
+                out.push(Chrome::Text { x: left, y, text: "●".into(), color: dot, max_w: cw });
+                out.push(Chrome::Text { x: left + 2.0 * cw, y, text: label, color: theme::FOREGROUND, max_w: text_w - 2.0 * cw });
+                out.push(Chrome::Text { x: left + 2.0 * cw, y: y + line, text: detail, color: if state.is_some() { dot } else { theme::MUTED }, max_w: text_w - 2.0 * cw });
+                self.sidebar_hits.push((row, id));
+                y += 2.0 * line + 8.0 * s;
+            }
+            y += 6.0 * s;
+        }
+    }
+
+    /// Activate the tab holding `id` and focus it.
+    fn jump_to(&mut self, id: PaneId) {
+        if let Some(i) = self.tabs.list.iter().position(|t| t.root.contains(id)) {
+            self.commit_rename();
+            self.tabs.select(i);
+            self.tabs.active_mut().focused = id;
+            self.after_tab_change();
+        }
+    }
+
     fn update_title(&self) {
         if !self.tabs.list.is_empty() {
             self.window.set_title(&self.tab_title(self.tabs.active));
@@ -285,16 +412,17 @@ impl State {
             rect: Rect { x: 0.0, y: BAR_H * s - s, w: width, h: s },
             color: HAIRLINE,
         }];
+        self.sidebar_chrome(&mut out);
         self.tab_hits.clear();
         let n = self.tabs.list.len() as f32;
-        let room = width - TABS_X * s - PLUS_W * s - 2.0 * PAD * s;
+        let room = width - self.tabs_x() - PLUS_W * s - 2.0 * PAD * s;
         let tab_w = (room / n).min(TAB_MAX_W * s).floor();
         self.tab_w = tab_w;
         let (top, h) = (5.0 * s, BAR_H * s - 6.0 * s);
         let text_y = top + ((h - ch) / 2.0).round();
         let mut dragged_chrome = vec![];
         self.animating = false;
-        let first_x = TABS_X * s;
+        let first_x = self.tabs_x();
         let last_x = first_x + (n - 1.0).max(0.0) * tab_w;
         for i in 0..self.tabs.list.len() {
             let slot_x = first_x + i as f32 * tab_w;
@@ -338,8 +466,15 @@ impl State {
                 let caret_x = x + TAB_PAD * s + (text.chars().count() as f32 * cw).min(max_w);
                 out.push(Chrome::Rect { rect: Rect { x: caret_x, y: text_y, w: 2.0 * s, h: ch }, color: theme::ACCENT });
             }
+            let mut text_x = x + TAB_PAD * s;
+            let mut max_w = max_w;
+            if !editing && self.tab_waiting(i) {
+                out.push(Chrome::Text { x: text_x, y: text_y, text: "●".into(), color: WARM, max_w: cw });
+                text_x += 2.0 * cw;
+                max_w -= 2.0 * cw;
+            }
             out.push(Chrome::Text {
-                x: x + TAB_PAD * s,
+                x: text_x,
                 y: text_y,
                 text,
                 color: if active { theme::FOREGROUND } else { theme::MUTED },
@@ -361,7 +496,7 @@ impl State {
         out.extend(dragged_chrome);
         let ids: Vec<u64> = self.tabs.list.iter().map(|t| t.id).collect();
         self.tab_x.retain(|id, _| ids.contains(id));
-        let plus_x = TABS_X * s + n * tab_w;
+        let plus_x = first_x + n * tab_w;
         out.push(Chrome::Text {
             x: plus_x + ((PLUS_W * s - cw) / 2.0).round(),
             y: text_y,
@@ -550,6 +685,10 @@ impl State {
             }
             "d" => self.split(if m.shift_key() { Dir::Down } else { Dir::Right }),
             "r" if m.shift_key() => self.start_rename(self.tabs.active),
+            "b" => {
+                self.sidebar = !self.sidebar;
+                self.relayout();
+            }
             "=" | "+" => self.set_font_size(self.font_points + 1.0),
             "-" => self.set_font_size(self.font_points - 1.0),
             "0" => self.set_font_size(self.config.font.size),
@@ -635,6 +774,10 @@ impl ApplicationHandler<UserEvent> for App {
             animating: false,
             hovered_tab: None,
             tab_w: 0.0,
+            socket: self.socket.clone(),
+            sidebar: true,
+            sidebar_hits: vec![],
+            next_tick: Instant::now(),
         };
         st.new_tab();
         if st.tabs.list.is_empty() {
@@ -646,7 +789,21 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         let Some(st) = self.state.as_mut() else { return };
-        let UserEvent::Term(id, event) = event;
+        let (id, event) = match event {
+            UserEvent::Term(id, event) => (id, event),
+            UserEvent::Status(id, claude) => {
+                let Some(pane) = st.panes.get_mut(&id) else { return };
+                let prev = pane.claude.map(|c| c.claude);
+                if prev != claude {
+                    pane.claude = claude.map(|claude| status::State { claude, since: Instant::now() });
+                    if claude == Some(status::Claude::Waiting) && !st.window_focused {
+                        st.window.request_user_attention(Some(winit::window::UserAttentionType::Informational));
+                    }
+                }
+                st.window.request_redraw();
+                return;
+            }
+        };
         if let Event::Exit | Event::ChildExit(_) = event {
             if st.close_pane(id) {
                 event_loop.exit();
@@ -757,6 +914,7 @@ impl ApplicationHandler<UserEvent> for App {
                     st.hovered_tab = hovered;
                     st.window.request_redraw();
                 }
+                let tabs_x = st.tabs_x();
                 if let Some(drag) = st.dragging_tab.as_mut() {
                     if !drag.moving && (x - drag.press_x).abs() > 4.0 * s {
                         drag.moving = true;
@@ -765,7 +923,7 @@ impl ApplicationHandler<UserEvent> for App {
                     if drag.moving && st.tab_w > 0.0 {
                         // Swap once the dragged tab's centre crosses into a neighbour's slot.
                         let n = st.tabs.list.len();
-                        let centre = x - drag.grab + st.tab_w / 2.0 - TABS_X * s;
+                        let centre = x - drag.grab + st.tab_w / 2.0 - tabs_x;
                         let to = ((centre / st.tab_w).floor().max(0.0) as usize).min(n - 1);
                         let from = drag.index;
                         drag.index = to;
@@ -793,6 +951,14 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::MouseInput { state, button, .. } => {
                 let pressed = state == ElementState::Pressed;
                 let (x, y) = (st.mouse.x as f32, st.mouse.y as f32);
+                if pressed && button == MouseButton::Left && x < st.sidebar_w() {
+                    if let Some(id) = st.sidebar_hits.iter().find(|(r, _)| r.contains(x, y)).map(|(_, id)| *id) {
+                        st.jump_to(id);
+                    } else if y < BAR_H * st.scale() {
+                        let _ = st.window.drag_window();
+                    }
+                    return;
+                }
                 if pressed && button == MouseButton::Left && y < BAR_H * st.scale() {
                     match st.tab_hits.iter().find(|(r, _)| r.contains(x, y)).map(|(_, h)| h) {
                         Some(TabHit::Tab(i)) => {
@@ -800,7 +966,7 @@ impl ApplicationHandler<UserEvent> for App {
                             let now = Instant::now();
                             let double = st.last_tab_click.is_some_and(|(t, j)| j == i && now - t < MULTI_CLICK);
                             st.last_tab_click = Some((now, i));
-                            let slot_x = TABS_X * st.scale() + i as f32 * st.tab_w;
+                            let slot_x = st.tabs_x() + i as f32 * st.tab_w;
                             st.dragging_tab = Some(TabDrag { index: i, press_x: x, grab: x - slot_x, moving: false });
                             if double {
                                 st.start_rename(i);
@@ -922,9 +1088,17 @@ impl ApplicationHandler<UserEvent> for App {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let Some(st) = self.state.as_mut() else { return };
         let blinking = st.window_focused && st.focused().session.term.lock().cursor_style().blinking;
+        // Elapsed times in the sidebar change every minute; refresh twice a minute.
+        let now = Instant::now();
+        if now >= st.next_tick {
+            st.next_tick = now + Duration::from_secs(30);
+            if st.sidebar && st.panes.values().any(|p| p.claude.is_some()) {
+                st.window.request_redraw();
+            }
+        }
         if !blinking {
             st.cursor_on = true;
-            event_loop.set_control_flow(ControlFlow::Wait);
+            event_loop.set_control_flow(ControlFlow::WaitUntil(st.next_tick));
             return;
         }
         if Instant::now() >= st.next_blink {
@@ -932,7 +1106,25 @@ impl ApplicationHandler<UserEvent> for App {
             st.next_blink = Instant::now() + BLINK;
             st.window.request_redraw();
         }
-        event_loop.set_control_flow(ControlFlow::WaitUntil(st.next_blink));
+        event_loop.set_control_flow(ControlFlow::WaitUntil(st.next_blink.min(st.next_tick)));
+    }
+}
+
+fn folder_name(cwd: Option<PathBuf>) -> String {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    match cwd {
+        Some(p) if Some(&p) == home.as_ref() => "~".into(),
+        Some(p) => p.file_name().map_or("/".into(), |n| n.to_string_lossy().into_owned()),
+        None => "zsh".into(),
+    }
+}
+
+/// Name of the git repository containing `cwd`, else the folder name.
+fn project_name(cwd: Option<PathBuf>) -> String {
+    let Some(dir) = cwd else { return "zsh".into() };
+    match dir.ancestors().find(|d| d.join(".git").exists()) {
+        Some(root) => folder_name(Some(root.to_path_buf())),
+        None => folder_name(Some(dir)),
     }
 }
 
@@ -940,6 +1132,11 @@ fn main() {
     let config = config::load();
     let event_loop = EventLoop::<UserEvent>::with_user_event().build().expect("event loop");
     let proxy = event_loop.create_proxy();
-    let mut app = App { config, proxy, state: None };
+    let socket = status::socket_path();
+    if let Err(e) = status::listen(socket.clone(), proxy.clone()) {
+        eprintln!("cardumen: status socket unavailable ({e}); the sidebar will not show Claude Code states");
+    }
+    let mut app = App { socket: socket.clone(), config, proxy, state: None };
     event_loop.run_app(&mut app).expect("run");
+    let _ = std::fs::remove_file(socket);
 }

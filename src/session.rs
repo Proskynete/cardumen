@@ -18,6 +18,8 @@ use crate::layout::PaneId;
 
 pub enum UserEvent {
     Term(PaneId, Event),
+    /// Claude Code state reported by a hook; `None` = session ended.
+    Status(PaneId, Option<crate::status::Claude>),
 }
 
 #[derive(Clone)]
@@ -88,12 +90,14 @@ impl<L: EventListener + Clone + Send + 'static> Session<L> {
         listener: L,
         banner: Option<String>,
         cwd: Option<PathBuf>,
+        extra_env: Vec<(String, String)>,
     ) -> std::io::Result<Self> {
         let mut env = HashMap::from([
             ("TERM".to_string(), "xterm-256color".to_string()),
             ("COLORTERM".to_string(), "truecolor".to_string()),
             ("TERM_PROGRAM".to_string(), "cardumen".to_string()),
         ]);
+        env.extend(extra_env);
         let locale = ["LANG", "LC_ALL", "LC_CTYPE"].map(|k| std::env::var(k).ok());
         if needs_lang(&locale) {
             env.insert("LANG".into(), "en_US.UTF-8".into());
@@ -181,7 +185,7 @@ mod tests {
 
     fn start(cols: u16) -> (Session<Probe>, mpsc::Receiver<String>) {
         let (tx, rx) = mpsc::channel();
-        let s = Session::spawn(size(cols, 24), 1000, Probe(tx), Some("BANNER\r\n".into()), None).unwrap();
+        let s = Session::spawn(size(cols, 24), 1000, Probe(tx), Some("BANNER\r\n".into()), None, vec![]).unwrap();
         (s, rx)
     }
 
@@ -273,7 +277,7 @@ mod tests {
     #[test]
     fn starts_in_cwd_and_tracks_cd() {
         let (tx, _rx) = mpsc::channel();
-        let s = Session::spawn(size(80, 24), 100, Probe(tx), None, Some("/usr".into())).unwrap();
+        let s = Session::spawn(size(80, 24), 100, Probe(tx), None, Some("/usr".into()), vec![]).unwrap();
         ready(&s);
         assert_eq!(s.cwd().unwrap(), PathBuf::from("/usr"));
         s.write(b"cd /tmp\r".to_vec());
