@@ -19,7 +19,8 @@ use crate::layout::PaneId;
 pub enum UserEvent {
     Term(PaneId, Event),
     /// Claude Code state reported by a hook; `None` = session ended.
-    Status(PaneId, Option<crate::status::Claude>),
+    Status(PaneId, Option<crate::status::Claude>, crate::status::Hook),
+    Context(crate::context::Update),
 }
 
 #[derive(Clone)]
@@ -131,25 +132,34 @@ impl<L: EventListener + Clone + Send + 'static> Session<L> {
         let _ = self.sender.send(Msg::Input(bytes.into()));
     }
 
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+
     /// The shell's current directory (what `pwd` prints at the prompt).
     pub fn cwd(&self) -> Option<PathBuf> {
-        let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as i32;
-        // SAFETY: proc_pidinfo fills at most `size` bytes of the zeroed struct we own;
-        // vip_path is a NUL-terminated C string inside it.
-        unsafe {
-            let mut info: libc::proc_vnodepathinfo = std::mem::zeroed();
-            let n = libc::proc_pidinfo(self.pid as i32, libc::PROC_PIDVNODEPATHINFO, 0, (&raw mut info).cast(), size);
-            if n != size {
-                return None;
-            }
-            let path = std::ffi::CStr::from_ptr(info.pvi_cdir.vip_path.as_ptr().cast());
-            Some(PathBuf::from(path.to_string_lossy().into_owned()))
-        }
+        cwd_of(self.pid)
     }
 
     pub fn resize(&self, size: WindowSize) {
         self.term.lock().resize(GridSize { cols: size.num_cols as usize, lines: size.num_lines as usize });
         let _ = self.sender.send(Msg::Resize(size));
+    }
+}
+
+/// Current directory of a process.
+pub fn cwd_of(pid: u32) -> Option<PathBuf> {
+    let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as i32;
+    // SAFETY: proc_pidinfo fills at most `size` bytes of the zeroed struct we own;
+    // vip_path is a NUL-terminated C string inside it.
+    unsafe {
+        let mut info: libc::proc_vnodepathinfo = std::mem::zeroed();
+        let n = libc::proc_pidinfo(pid as i32, libc::PROC_PIDVNODEPATHINFO, 0, (&raw mut info).cast(), size);
+        if n != size {
+            return None;
+        }
+        let path = std::ffi::CStr::from_ptr(info.pvi_cdir.vip_path.as_ptr().cast());
+        Some(PathBuf::from(path.to_string_lossy().into_owned()))
     }
 }
 

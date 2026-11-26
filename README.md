@@ -43,6 +43,7 @@ size = 14.0
 | Cmd+D / Cmd+Shift+D | split right / split down |
 | Cmd+Option+Arrows | focus the pane in that direction |
 | Cmd+B | show / hide the session sidebar |
+| Cmd+I | show / hide the Resumen panel (step, Claude, PR/MR, changes) |
 | Cmd+Q | quit |
 | Option+←/→ | word left/right (`ESC b` / `ESC f`) |
 | Cmd+←/→, Cmd+⌫ | line start/end, delete line |
@@ -59,6 +60,17 @@ The sidebar shows each Claude Code session as working, waiting for you, or done.
 
 ```sh
 scripts/install-hooks.py
+```
+
+## Setting up on another Mac
+
+```sh
+brew install rustup gh            # glab instead of (or besides) gh for GitLab
+rustup default stable
+git clone <this repo> && cd cardumen
+scripts/bundle.sh --install       # builds for that Mac's CPU and installs the app
+scripts/install-hooks.py          # Claude Code hooks for the session sidebar
+gh auth login                     # or: glab auth login
 ```
 
 ## Specs

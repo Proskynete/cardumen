@@ -1,4 +1,5 @@
 mod config;
+mod context;
 mod font;
 mod input;
 mod layout;
@@ -47,6 +48,9 @@ const DIVIDER: f32 = 1.0;
 
 const HAIRLINE: Rgb = [0x1F, 0x33, 0x3D];
 const SIDEBAR_W: f32 = 230.0;
+const PANEL_W: f32 = 320.0;
+const MERGED: Rgb = [0xC3, 0x8F, 0xD9];
+const ERROR: Rgb = [0xE1, 0x57, 0x57];
 const SIDEBAR_BG: Rgb = [0x0C, 0x17, 0x1D];
 const WARM: Rgb = [0xF2, 0xA6, 0x5A];
 const SUCCESS: Rgb = [0x4F, 0xB4, 0x77];
@@ -60,6 +64,10 @@ struct Pane {
     title: Option<String>,
     rect: Rect,
     claude: Option<status::State>,
+    ctx: Option<Box<context::Context>>,
+    /// What Claude asked permission for, while waiting.
+    ask: Option<String>,
+    last_message: Option<String>,
 }
 
 enum TabHit {
@@ -102,6 +110,8 @@ struct State {
     sidebar: bool,
     sidebar_hits: Vec<(Rect, PaneId)>,
     next_tick: Instant,
+    panel: bool,
+    ctx_tx: std::sync::mpsc::Sender<context::Request>,
 }
 
 struct TabDrag {
@@ -128,10 +138,21 @@ impl State {
         if self.sidebar { SIDEBAR_W * self.scale() } else { 0.0 }
     }
 
+    fn panel_w(&self) -> f32 {
+        if self.panel { PANEL_W * self.scale() } else { 0.0 }
+    }
+
     fn content_rect(&self) -> Rect {
         let size = self.window.inner_size();
         let (top, left) = (BAR_H * self.scale(), self.sidebar_w());
-        Rect { x: left, y: top, w: (size.width as f32 - left).max(1.0), h: (size.height as f32 - top).max(1.0) }
+        let w = size.width as f32 - left - self.panel_w();
+        Rect { x: left, y: top, w: w.max(1.0), h: (size.height as f32 - top).max(1.0) }
+    }
+
+    /// Tell the context worker which shells exist.
+    fn sync_panes(&self) {
+        let panes = self.panes.iter().map(|(id, p)| (*id, p.session.pid())).collect();
+        let _ = self.ctx_tx.send(context::Request::Panes(panes));
     }
 
     /// Where the first tab starts: after the traffic lights, or after the sidebar.
@@ -212,7 +233,8 @@ impl State {
         ];
         match Session::spawn(size, self.config.scrollback, Listener(self.proxy.clone(), id), banner, cwd, env) {
             Ok(session) => {
-                self.panes.insert(id, Pane { session, title: None, rect, claude: None });
+                self.panes.insert(id, Pane { session, title: None, rect, claude: None, ctx: None, ask: None, last_message: None });
+                self.sync_panes();
                 true
             }
             Err(e) => {
@@ -259,6 +281,7 @@ impl State {
         }
         self.renaming = None;
         self.tabs.remove_pane(id);
+        self.sync_panes();
         if self.tabs.list.is_empty() {
             return true;
         }
@@ -343,16 +366,9 @@ impl State {
         let (waiting, working) = (count(status::Claude::Waiting), count(status::Claude::Working));
 
         let mut y = BAR_H * s + 6.0 * s;
-        let first = format!("● {waiting} espera");
-        let second_x = left + (first.chars().count() + 2) as f32 * cw;
-        out.push(Chrome::Text { x: left, y, text: first, color: if waiting > 0 { WARM } else { theme::MUTED }, max_w: text_w });
-        out.push(Chrome::Text {
-            x: second_x,
-            y,
-            text: format!("● {working} trabaja"),
-            color: if working > 0 { theme::ACCENT } else { theme::MUTED },
-            max_w: left + text_w - second_x,
-        });
+        out.push(Chrome::Text { x: left, y, text: format!("● {waiting} te esperan"), color: if waiting > 0 { WARM } else { theme::MUTED }, max_w: text_w });
+        y += line;
+        out.push(Chrome::Text { x: left, y, text: format!("● {working} trabajando"), color: if working > 0 { theme::ACCENT } else { theme::MUTED }, max_w: text_w });
         y += line + 10.0 * s;
 
         let focused = self.focused_id();
@@ -363,7 +379,7 @@ impl State {
             out.push(Chrome::Text { x: left, y, text: project, color: theme::MUTED, max_w: text_w });
             y += line;
             for (id, tab) in rows {
-                let row = Rect { x: 6.0 * s, y: y - 3.0 * s, w: w - 12.0 * s, h: 2.0 * line + 2.0 * s };
+                let row = Rect { x: 6.0 * s, y: y - 3.0 * s, w: w - 12.0 * s, h: 3.0 * line + 2.0 * s };
                 if id == focused {
                     out.push(Chrome::Rect { rect: row, color: TAB_BG });
                 }
@@ -380,10 +396,171 @@ impl State {
                 out.push(Chrome::Text { x: left, y, text: "●".into(), color: dot, max_w: cw });
                 out.push(Chrome::Text { x: left + 2.0 * cw, y, text: label, color: theme::FOREGROUND, max_w: text_w - 2.0 * cw });
                 out.push(Chrome::Text { x: left + 2.0 * cw, y: y + line, text: detail, color: if state.is_some() { dot } else { theme::MUTED }, max_w: text_w - 2.0 * cw });
+                if let Some(ctx) = self.panes.get(&id).and_then(|p| p.ctx.as_deref()) {
+                    let mut third = ctx.step().label();
+                    if let context::PrInfo::Found(pr) = &ctx.pr {
+                        third.push_str(&format!(" · {}", pr.number));
+                    }
+                    out.push(Chrome::Text { x: left + 2.0 * cw, y: y + 2.0 * line, text: third, color: theme::MUTED, max_w: text_w - 2.0 * cw });
+                }
+                let row = Rect { h: 3.0 * line + 2.0 * s, ..row };
                 self.sidebar_hits.push((row, id));
-                y += 2.0 * line + 8.0 * s;
+                y += 3.0 * line + 8.0 * s;
             }
             y += 6.0 * s;
+        }
+    }
+
+    /// Right "Resumen" panel for the focused pane: step, Claude, PR/MR, changes.
+    fn panel_chrome(&self, out: &mut Vec<Chrome>) {
+        let pw = self.panel_w();
+        if pw == 0.0 {
+            return;
+        }
+        let s = self.scale();
+        let (cw, ch) = (self.fonts.cell_w, self.fonts.cell_h);
+        let size = self.window.inner_size();
+        let (x0, height) = (size.width as f32 - pw, size.height as f32);
+        out.push(Chrome::Rect { rect: Rect { x: x0, y: 0.0, w: pw, h: height }, color: SIDEBAR_BG });
+        out.push(Chrome::Rect { rect: Rect { x: x0, y: 0.0, w: s, h: height }, color: HAIRLINE });
+        let left = x0 + 16.0 * s;
+        let text_w = pw - 32.0 * s;
+        let cols = (text_w / cw).floor().max(1.0) as usize;
+        let line = ch + 4.0 * s;
+        let mut y = BAR_H * s + 6.0 * s;
+        let text = |out: &mut Vec<Chrome>, y: &mut f32, x: f32, t: String, color: Rgb| {
+            if *y < height {
+                out.push(Chrome::Text { x, y: *y, text: t, color, max_w: left + text_w - x });
+            }
+            *y += line;
+        };
+        let id = self.focused_id();
+        let Some(pane) = self.panes.get(&id) else { return };
+        let label = self.tabs.active().name.clone().unwrap_or_else(|| self.pane_label(id));
+        text(out, &mut y, left, label, theme::FOREGROUND);
+        let ctx = pane.ctx.as_deref();
+        match ctx.and_then(|c| c.branch.clone()) {
+            Some(b) => text(out, &mut y, left, format!("\u{e0a0} {b}"), theme::MUTED),
+            None => text(out, &mut y, left, "fuera de un repo git".into(), theme::MUTED),
+        }
+        y += 8.0 * s;
+
+        let section = |out: &mut Vec<Chrome>, y: &mut f32, title: &str| {
+            *y += 6.0 * s;
+            out.push(Chrome::Rect { rect: Rect { x: left, y: *y - 6.0 * s, w: text_w, h: s }, color: HAIRLINE });
+            out.push(Chrome::Text { x: left, y: *y, text: title.into(), color: theme::ACCENT, max_w: text_w });
+            *y += line + 2.0 * s;
+        };
+
+        if let Some(ctx) = ctx {
+            section(out, &mut y, "Paso");
+            let step = ctx.step();
+            let stages: Vec<(usize, String)> = [
+                (0, "Spec".to_string()),
+                (1, match (step, &ctx.spec) {
+                    (context::Step::Tasks(d, t), _) => format!("Tareas {d}/{t}"),
+                    (_, Some(sp)) if sp.total > 0 => format!("Tareas {}/{}", sp.done, sp.total),
+                    _ => "Tareas".into(),
+                }),
+                (2, "PR / MR".into()),
+                (3, "Review".into()),
+                (4, "Merge".into()),
+            ]
+            .into_iter()
+            .filter(|(k, _)| ctx.spec.is_some() || *k >= 2)
+            .collect();
+            for (k, name) in stages {
+                let cur = step.index();
+                let (mark, color, tcolor) = match k.cmp(&cur) {
+                    std::cmp::Ordering::Less => ("✓", SUCCESS, theme::MUTED),
+                    std::cmp::Ordering::Equal => ("●", theme::ACCENT, theme::FOREGROUND),
+                    std::cmp::Ordering::Greater => ("○", theme::MUTED, theme::MUTED),
+                };
+                if y < height {
+                    out.push(Chrome::Text { x: left, y, text: mark.into(), color, max_w: cw });
+                }
+                text(out, &mut y, left + 2.0 * cw, name, tcolor);
+            }
+            if let Some(sp) = &ctx.spec {
+                text(out, &mut y, left, format!("openspec · {}", sp.change), theme::MUTED);
+            }
+        }
+
+        section(out, &mut y, "Claude");
+        match (pane.claude.map(|c| c.claude), &pane.ask, &pane.last_message) {
+            (Some(status::Claude::Waiting), ask, _) => {
+                text(out, &mut y, left, "te espera".into(), WARM);
+                if let Some(ask) = ask {
+                    for l in context::wrap(&format!("pide permiso: {ask}"), cols).into_iter().take(6) {
+                        text(out, &mut y, left, l, theme::FOREGROUND);
+                    }
+                }
+            }
+            (_, _, Some(msg)) => {
+                let lines = context::wrap(msg, cols);
+                let more = lines.len() > 12;
+                for l in lines.into_iter().take(12) {
+                    text(out, &mut y, left, l, theme::FOREGROUND);
+                }
+                if more {
+                    text(out, &mut y, left, "…".into(), theme::MUTED);
+                }
+            }
+            (Some(_), _, None) => text(out, &mut y, left, "trabajando…".into(), theme::ACCENT),
+            (None, _, None) => text(out, &mut y, left, "sin sesión de Claude".into(), theme::MUTED),
+        }
+
+        let Some(ctx) = ctx else { return };
+        section(out, &mut y, if ctx.provider == Some(context::Provider::GitLab) { "MR" } else { "PR" });
+        match &ctx.pr {
+            context::PrInfo::Found(pr) => {
+                let color = match pr.state {
+                    context::PrState::Open => theme::ACCENT,
+                    context::PrState::Approved => SUCCESS,
+                    context::PrState::ChangesRequested => WARM,
+                    context::PrState::Draft => theme::MUTED,
+                    context::PrState::Merged => MERGED,
+                    context::PrState::Closed => ERROR,
+                };
+                text(out, &mut y, left, format!("{} {}", pr.number, pr.state.label()), color);
+                for l in context::wrap(&pr.title, cols).into_iter().take(2) {
+                    text(out, &mut y, left, l, theme::FOREGROUND);
+                }
+            }
+            context::PrInfo::None => text(out, &mut y, left, "sin PR/MR para esta rama".into(), theme::MUTED),
+            context::PrInfo::Error(e) => {
+                for l in context::wrap(e, cols).into_iter().take(2) {
+                    text(out, &mut y, left, l, theme::MUTED);
+                }
+            }
+            context::PrInfo::Unknown => text(out, &mut y, left, "remote sin GitHub/GitLab".into(), theme::MUTED),
+        }
+
+        section(out, &mut y, "Cambios");
+        match &ctx.changes {
+            Some(c) if c.total_files > 0 => {
+                let unit = if c.total_files == 1 { "archivo" } else { "archivos" };
+                text(out, &mut y, left, format!("{} {unit} · +{} −{}", c.total_files, c.added, c.removed), theme::FOREGROUND);
+                if let Some(n) = c.unpushed.filter(|n| *n > 0) {
+                    text(out, &mut y, left, format!("{n} commits sin push"), WARM);
+                }
+                for f in &c.files {
+                    let plus = format!("+{}", f.added);
+                    let minus = format!("−{}", f.removed);
+                    let path_x = left + 12.0 * cw;
+                    let fit = ((left + text_w - path_x) / cw).floor().max(1.0) as usize;
+                    let n = f.path.chars().count();
+                    // Keep the end of long paths: the file name matters most.
+                    let path = if n > fit { format!("…{}", f.path.chars().skip(n + 1 - fit).collect::<String>()) } else { f.path.clone() };
+                    if y < height {
+                        out.push(Chrome::Text { x: left, y, text: plus, color: SUCCESS, max_w: 6.0 * cw });
+                        out.push(Chrome::Text { x: left + 6.0 * cw, y, text: minus, color: ERROR, max_w: 6.0 * cw });
+                    }
+                    text(out, &mut y, path_x, path, theme::MUTED);
+                }
+            }
+            Some(_) => text(out, &mut y, left, "sin cambios".into(), theme::MUTED),
+            None => text(out, &mut y, left, "—".into(), theme::MUTED),
         }
     }
 
@@ -413,9 +590,10 @@ impl State {
             color: HAIRLINE,
         }];
         self.sidebar_chrome(&mut out);
+        self.panel_chrome(&mut out);
         self.tab_hits.clear();
         let n = self.tabs.list.len() as f32;
-        let room = width - self.tabs_x() - PLUS_W * s - 2.0 * PAD * s;
+        let room = width - self.panel_w() - self.tabs_x() - PLUS_W * s - 2.0 * PAD * s;
         let tab_w = (room / n).min(TAB_MAX_W * s).floor();
         self.tab_w = tab_w;
         let (top, h) = (5.0 * s, BAR_H * s - 6.0 * s);
@@ -689,6 +867,10 @@ impl State {
                 self.sidebar = !self.sidebar;
                 self.relayout();
             }
+            "i" => {
+                self.panel = !self.panel;
+                self.relayout();
+            }
             "=" | "+" => self.set_font_size(self.font_points + 1.0),
             "-" => self.set_font_size(self.font_points - 1.0),
             "0" => self.set_font_size(self.config.font.size),
@@ -739,7 +921,7 @@ impl ApplicationHandler<UserEvent> for App {
         }
         let attrs = Window::default_attributes()
             .with_title("cardumen")
-            .with_inner_size(LogicalSize::new(980.0, 620.0))
+            .with_inner_size(LogicalSize::new(1320.0, 820.0))
             .with_titlebar_transparent(true)
             .with_fullsize_content_view(true)
             .with_title_hidden(true);
@@ -778,6 +960,11 @@ impl ApplicationHandler<UserEvent> for App {
             sidebar: true,
             sidebar_hits: vec![],
             next_tick: Instant::now(),
+            panel: true,
+            ctx_tx: {
+                let proxy = self.proxy.clone();
+                context::spawn(move |u| proxy.send_event(UserEvent::Context(u)).is_ok(), session::cwd_of)
+            },
         };
         st.new_tab();
         if st.tabs.list.is_empty() {
@@ -791,8 +978,34 @@ impl ApplicationHandler<UserEvent> for App {
         let Some(st) = self.state.as_mut() else { return };
         let (id, event) = match event {
             UserEvent::Term(id, event) => (id, event),
-            UserEvent::Status(id, claude) => {
+            UserEvent::Context(update) => {
+                match update {
+                    context::Update::Context(id, ctx) => {
+                        if let Some(p) = st.panes.get_mut(&id) {
+                            p.ctx = Some(ctx);
+                        }
+                    }
+                    context::Update::LastMessage(id, text) => {
+                        if let Some(p) = st.panes.get_mut(&id) {
+                            p.last_message = Some(text);
+                        }
+                    }
+                }
+                st.window.request_redraw();
+                return;
+            }
+            UserEvent::Status(id, claude, hook) => {
                 let Some(pane) = st.panes.get_mut(&id) else { return };
+                match claude {
+                    Some(status::Claude::Waiting) => pane.ask = hook.ask.clone(),
+                    _ => pane.ask = None,
+                }
+                if matches!(claude, Some(status::Claude::Done | status::Claude::Waiting)) {
+                    if let Some(path) = hook.transcript.clone() {
+                        let _ = st.ctx_tx.send(context::Request::Transcript(id, path));
+                    }
+                    let _ = st.ctx_tx.send(context::Request::Refresh(id));
+                }
                 let prev = pane.claude.map(|c| c.claude);
                 if prev != claude {
                     pane.claude = claude.map(|claude| status::State { claude, since: Instant::now() });

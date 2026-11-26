@@ -21,8 +21,9 @@ EVENTS = {
 
 
 def command(event: str) -> str:
+    # The hook's JSON payload (stdin) follows the event, with newlines removed.
     return (
-        f'[ -n "${MARK}" ] && printf \'%s {event}\\n\' "$CARDUMEN_PANE" '
+        f'[ -n "${MARK}" ] && {{ printf \'%s {event} \' "$CARDUMEN_PANE"; tr -d \'\\n\'; echo; }} '
         f'| nc -U -w 1 "${MARK}" >/dev/null 2>&1; exit 0'
     )
 
@@ -34,9 +35,13 @@ def main() -> None:
     changed = False
     for name, event in EVENTS.items():
         groups = hooks.setdefault(name, [])
-        if any(MARK in h.get("command", "") for g in groups for h in g.get("hooks", [])):
+        wanted = command(event)
+        ours = [g for g in groups if any(MARK in h.get("command", "") for h in g.get("hooks", []))]
+        if len(ours) == 1 and ours[0]["hooks"][0].get("command") == wanted:
             continue
-        groups.append({"hooks": [{"type": "command", "command": command(event)}]})
+        # Replace older Cardumen entries; other tools' hooks stay untouched.
+        groups[:] = [g for g in groups if g not in ours]
+        groups.append({"hooks": [{"type": "command", "command": wanted}]})
         changed = True
     if not changed:
         print("hooks already installed")
