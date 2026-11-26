@@ -33,7 +33,11 @@ The system SHALL use the "arrecife" theme by default: background `#091319`, fore
 - **THEN** the window background is `#091319`
 
 ### Requirement: Cursor
-The system SHALL draw the cursor in the shape requested by the application (block, beam, underline), blink it when requested, and draw it hollow when the window is unfocused.
+The default cursor SHALL be a blinking beam in the accent colour (`#35D6C0`), blinking every 530 ms and staying visible while the user types. The system SHALL draw the shape requested by the application (block, beam, underline), blink it when requested, and draw it hollow when the window is unfocused.
+
+#### Scenario: Default cursor
+- **WHEN** the shell has not requested a cursor style
+- **THEN** the cursor is a blinking accent-coloured beam
 
 #### Scenario: Unfocused
 - **WHEN** the window loses focus

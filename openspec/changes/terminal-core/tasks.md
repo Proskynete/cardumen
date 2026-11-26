@@ -34,6 +34,8 @@
 
 - [x] 6.1 `welcome.rs`: Tiburoncín grid to half-block truecolor ANSI (unit tests: pixel mapping and transparency)
 - [x] 6.2 Sysinfo through sysctl: chip, RAM, macOS version, uptime; banner layout with the narrow-window fallback
+- [x] 6.4 Boxed info sections (Hardware / Software / Tiempo), big 44×22 shark, width fallbacks
+- [x] 6.5 Default cursor: blinking accent beam
 - [x] 6.3 Feed the banner into `Term` before shell output; respect `welcome = false`
 
 ## 7. Verify

@@ -197,7 +197,15 @@ impl ApplicationHandler<UserEvent> for App {
         };
         state_size.num_lines = state_size.num_lines.max(1);
         let banner = self.config.welcome.then(|| {
-            let info = welcome::SysInfo::read(self.config.user_name.as_deref(), &fonts.family);
+            let display = window.current_monitor().map(|m| {
+                let size = m.size().to_logical::<u32>(m.scale_factor());
+                let hz = m.refresh_rate_millihertz().map_or(String::new(), |r| format!(", {} Hz", (r + 500) / 1000));
+                // winit falls back to "Monitor #<id>" when macOS gives no name; that adds nothing.
+                let name = m.name().filter(|n| !n.starts_with("Monitor #")).map_or(String::new(), |n| format!("{n} · "));
+                format!("{name}{}×{} @ {}x{hz}", size.width, size.height, m.scale_factor())
+            });
+            let font = format!("{} ({}pt)", fonts.family, self.config.font.size);
+            let info = welcome::SysInfo::read(self.config.user_name.as_deref(), &font, display);
             welcome::banner(&info, state_size.num_cols as usize)
         });
         let session = match Session::spawn(state_size, self.config.scrollback, Listener(self.proxy.clone()), banner) {

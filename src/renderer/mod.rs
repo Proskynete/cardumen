@@ -377,7 +377,7 @@ impl Renderer {
             let (x, y) = origin(c.col, c.line);
             let t = thickness.max(2.0);
             match c.shape {
-                CursorShape::Beam => self.quads.push(solid(x, y, t, ch, c.color)),
+                CursorShape::Beam => self.quads.push(solid(x, y, (fonts.px / 7.0).round().max(2.0), ch, c.color)),
                 CursorShape::Underline => self.quads.push(solid(x, y + ch - t, cw, t, c.color)),
                 CursorShape::HollowBlock => {
                     self.quads.push(solid(x, y, cw, t, c.color));

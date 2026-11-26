@@ -67,7 +67,11 @@ impl<L: EventListener + Clone + Send + 'static> Session<L> {
             env,
         };
         let grid = GridSize { cols: size.num_cols as usize, lines: size.num_lines as usize };
-        let config = term::Config { scrolling_history: scrollback, ..Default::default() };
+        let config = term::Config {
+            scrolling_history: scrollback,
+            default_cursor_style: ansi::CursorStyle { shape: ansi::CursorShape::Beam, blinking: true },
+            ..Default::default()
+        };
         let mut term = Term::new(config, &grid, listener.clone());
         if let Some(banner) = banner {
             ansi::Processor::<ansi::StdSyncHandler>::new().advance(&mut term, banner.as_bytes());

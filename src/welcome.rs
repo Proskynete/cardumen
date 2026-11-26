@@ -2,6 +2,8 @@
 use std::ffi::{CStr, CString};
 use std::fmt::Write;
 
+use crate::theme;
+
 /// Tiburoncín, 22 × 22, from eduardoalvarez.dev (`src/lib/tiburoncin.ts`).
 /// `.` empty · `k` outline · `b` body · `w` foam · `r` tongue.
 const PIXELS: [&str; 22] = [
@@ -29,10 +31,18 @@ const PIXELS: [&str; 22] = [
     ".......kkkkkk.........",
 ];
 
+
 const MUTED: &str = "\x1b[38;2;113;145;156m";
 const PRIMARY: &str = "\x1b[38;2;237;244;243m";
 const ACCENT: &str = "\x1b[38;2;53;214;192m";
+const WARM: &str = "\x1b[38;2;242;166;90m";
+const ERROR: &str = "\x1b[38;2;225;87;87m";
 const RESET: &str = "\x1b[0m";
+
+/// Visible width of the info boxes, in columns.
+const BOX_W: usize = 48;
+const GAP: usize = 4;
+const MARGIN: usize = 2;
 
 fn pixel(c: u8) -> Option<[u8; 3]> {
     match c {
@@ -44,7 +54,11 @@ fn pixel(c: u8) -> Option<[u8; 3]> {
     }
 }
 
-/// One string per text row (11 rows × 22 columns), each ending in a reset.
+fn fg(c: [u8; 3]) -> String {
+    format!("\x1b[38;2;{};{};{}m", c[0], c[1], c[2])
+}
+
+/// Small Tiburoncín: half-blocks, 22 columns × 11 rows.
 pub fn shark_rows() -> Vec<String> {
     PIXELS
         .chunks(2)
@@ -52,7 +66,6 @@ pub fn shark_rows() -> Vec<String> {
             let (top, bottom) = (pair[0].as_bytes(), pair[1].as_bytes());
             let mut row = String::new();
             for col in 0..top.len() {
-                let fg = |c: [u8; 3]| format!("\x1b[38;2;{};{};{}m", c[0], c[1], c[2]);
                 let bg = |c: [u8; 3]| format!("\x1b[48;2;{};{};{}m", c[0], c[1], c[2]);
                 match (pixel(top[col]), pixel(bottom[col])) {
                     (None, None) => row.push_str("\x1b[0m "),
@@ -67,33 +80,88 @@ pub fn shark_rows() -> Vec<String> {
         .collect()
 }
 
+/// Big Tiburoncín: each pixel is `██` (two cells ≈ a square), 44 columns × 22 rows.
+pub fn big_shark_rows() -> Vec<String> {
+    PIXELS
+        .iter()
+        .map(|line| {
+            let mut row = String::new();
+            for &c in line.as_bytes() {
+                match pixel(c) {
+                    Some(p) => write!(row, "{}██", fg(p)).unwrap(),
+                    None => row.push_str("\x1b[0m  "),
+                }
+            }
+            row.push_str(RESET);
+            row
+        })
+        .collect()
+}
+
 pub struct SysInfo {
     pub name: String,
-    pub chip: String,
-    pub ram_gb: u64,
+    pub cpu: String,
+    pub display: Option<String>,
+    pub disk: (u64, u64),
+    pub memory: (u64, u64),
+    pub swap: (u64, u64),
     pub macos: String,
-    pub uptime_secs: u64,
+    pub kernel: String,
     pub shell: String,
+    pub packages: usize,
     pub font: String,
+    pub os_installed: Option<i64>,
+    pub uptime_secs: u64,
+    pub last_update: Option<i64>,
 }
 
 impl SysInfo {
-    pub fn read(user_name: Option<&str>, font: &str) -> Self {
-        let boot = boot_time().unwrap_or(0);
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+    pub fn read(user_name: Option<&str>, font: &str, display: Option<String>) -> Self {
+        let now = unix_now();
+        let chip = sysctl_string("machdep.cpu.brand_string").unwrap_or_else(|| "unknown".into());
+        let p = sysctl_u64("hw.perflevel0.physicalcpu").unwrap_or(0);
+        let e = sysctl_u64("hw.perflevel1.physicalcpu").unwrap_or(0);
+        let cpu = if p + e > 0 { format!("{chip} · {} núcleos ({p}P + {e}E)", p + e) } else { chip };
+        let total_mem = sysctl_u64("hw.memsize").unwrap_or(0);
+        let page = sysctl_u64("hw.pagesize").unwrap_or(16_384);
+        // Free + file cache + purgeable is memory macOS hands out on demand; the rest is "used".
+        let reclaimable = ["vm.page_free_count", "vm.page_pageable_external_count", "vm.page_purgeable_count"]
+            .iter()
+            .filter_map(|n| sysctl_u64(n))
+            .sum::<u64>()
+            * page;
+        let version = sysctl_string("kern.osproductversion").unwrap_or_default();
         let shell = std::env::var("SHELL").unwrap_or_default();
         Self {
             name: user_name.map(str::to_owned).unwrap_or_else(full_name),
-            chip: sysctl_string("machdep.cpu.brand_string").unwrap_or_else(|| "unknown".into()),
-            ram_gb: sysctl_u64("hw.memsize").unwrap_or(0) >> 30,
-            macos: sysctl_string("kern.osproductversion").unwrap_or_default(),
-            uptime_secs: now.saturating_sub(boot),
+            cpu,
+            display,
+            disk: disk_usage("/System/Volumes/Data").unwrap_or((0, 0)),
+            memory: (total_mem.saturating_sub(reclaimable), total_mem),
+            swap: swap_usage().unwrap_or((0, 0)),
+            macos: format!("macOS {} {version}", codename(&version)).replace("  ", " "),
+            kernel: format!("Darwin {}", sysctl_string("kern.osrelease").unwrap_or_default()),
             shell: shell.rsplit('/').next().unwrap_or("zsh").to_string(),
+            packages: ["/opt/homebrew/Cellar", "/opt/homebrew/Caskroom"]
+                .iter()
+                .filter_map(|d| std::fs::read_dir(d).ok())
+                .map(|d| d.count())
+                .sum(),
             font: font.to_string(),
+            os_installed: birth_time("/var/db/.AppleSetupDone"),
+            uptime_secs: boot_time().map_or(0, |b| now.saturating_sub(b)),
+            last_update: modified_time("/Library/Receipts/InstallHistory.plist"),
         }
+    }
+}
+
+fn codename(version: &str) -> &'static str {
+    match version.split('.').next().unwrap_or("") {
+        "26" => "Tahoe",
+        "15" => "Sequoia",
+        "14" => "Sonoma",
+        "13" => "Ventura",
+        _ => "",
     }
 }
 
@@ -106,34 +174,127 @@ pub fn format_uptime(secs: u64) -> String {
     }
 }
 
+fn gib(bytes: u64) -> String {
+    let g = bytes as f64 / (1u64 << 30) as f64;
+    if g >= 100.0 { format!("{g:.0} GiB") } else { format!("{g:.1} GiB") }
+}
+
+/// "used / total (pct%)", with the percentage coloured by how full it is.
+pub fn usage(used: u64, total: u64) -> String {
+    let pct = if total == 0 { 0 } else { (used as f64 / total as f64 * 100.0).round() as u64 };
+    let color = match pct {
+        90.. => ERROR,
+        70..=89 => WARM,
+        _ => ACCENT,
+    };
+    format!("{} / {} ({color}{pct}%{PRIMARY})", gib(used), gib(total))
+}
+
+const MONTHS: [&str; 12] = ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic"];
+
+/// Local date like "13 nov 2026, 19:57" (short enough to fit the box).
+fn format_date(ts: i64) -> String {
+    // SAFETY: localtime_r writes into the zeroed tm we own.
+    let tm = unsafe {
+        let mut tm: libc::tm = std::mem::zeroed();
+        libc::localtime_r(&ts, &mut tm);
+        tm
+    };
+    format!(
+        "{} {} {}, {:02}:{:02}",
+        tm.tm_mday,
+        MONTHS[tm.tm_mon as usize % 12],
+        tm.tm_year + 1900,
+        tm.tm_hour,
+        tm.tm_min
+    )
+}
+
+fn format_age(secs: u64) -> String {
+    let days = secs / 86_400;
+    match days {
+        0..=60 => format!("{days} días"),
+        _ if days < 730 => format!("{} meses", days / 30),
+        _ => format!("{} años, {} meses", days / 365, days % 365 / 30),
+    }
+}
+
+/// A box: `┌── title ──┐`, one `│ icon  value` line per item, `└────┘`.
+fn section(title: &str, items: &[(char, String)]) -> Vec<String> {
+    let inner = BOX_W - 2;
+    let label = format!(" {title} ");
+    let left = (inner - label.chars().count()) / 2;
+    let right = inner - left - label.chars().count();
+    let mut out = vec![format!("{MUTED}┌{}{ACCENT}{label}{MUTED}{}┐{RESET}", "─".repeat(left), "─".repeat(right))];
+    for (icon, value) in items {
+        out.push(format!("{MUTED}│ {ACCENT}{icon}  {PRIMARY}{value}{RESET}"));
+    }
+    out.push(format!("{MUTED}└{}┘{RESET}", "─".repeat(inner)));
+    out
+}
+
+pub fn info_lines(info: &SysInfo) -> Vec<String> {
+    let now = unix_now() as i64;
+    let mut hardware = vec![('\u{f2db}', info.cpu.clone())];
+    if let Some(d) = &info.display {
+        hardware.push(('\u{f108}', d.clone()));
+    }
+    hardware.push(('\u{f0a0}', format!("{}  disco", usage(info.disk.0, info.disk.1))));
+    hardware.push(('\u{f233}', format!("{}  memoria", usage(info.memory.0, info.memory.1))));
+    hardware.push(('\u{f0ec}', format!("{}  swap", usage(info.swap.0, info.swap.1))));
+    let dots: String = [theme::ACCENT, [0xF2, 0xA6, 0x5A], [0x4F, 0xB4, 0x77], [0xE1, 0x57, 0x57], [0x3E, 0x7C, 0xB1], theme::FOREGROUND]
+        .iter()
+        .map(|c| format!("{}●", fg(*c)))
+        .collect();
+    let software = [
+        ('\u{f179}', info.macos.clone()),
+        ('\u{f013}', info.kernel.clone()),
+        ('\u{f120}', info.shell.clone()),
+        ('\u{f2d0}', format!("cardumen {}", env!("CARGO_PKG_VERSION"))),
+        ('\u{f0fc}', format!("{} (brew)", info.packages)),
+        ('\u{f1fc}', format!("arrecife {dots}")),
+        ('\u{f031}', info.font.clone()),
+    ];
+    let mut time = vec![];
+    if let Some(t) = info.os_installed {
+        time.push(('\u{f254}', format!("{MUTED}instalado {PRIMARY}hace {}", format_age(now.saturating_sub(t) as u64))));
+    }
+    time.push(('\u{f017}', format!("{MUTED}encendido {PRIMARY}{}", format_uptime(info.uptime_secs))));
+    if let Some(t) = info.last_update {
+        time.push(('\u{f021}', format!("{MUTED}actualizado {PRIMARY}{}", format_date(t))));
+    }
+    let mut lines = vec![format!("\x1b[1m{PRIMARY}{}{RESET}", info.name)];
+    lines.extend(section("Hardware", &hardware));
+    lines.extend(section("Software", &software));
+    lines.extend(section("Tiempo", &time));
+    lines
+}
+
 /// Banner as terminal bytes (CRLF line endings, since it bypasses the tty).
 pub fn banner(info: &SysInfo, cols: usize) -> String {
-    let field = |label: &str, value: &str| format!("{MUTED}{label:<8}{PRIMARY}{value}{RESET}");
-    let info_lines = [
-        format!("\x1b[1m{PRIMARY}{}{RESET}", info.name),
-        format!("{ACCENT}{}{RESET}", "─".repeat(info.name.chars().count())),
-        field("chip", &info.chip),
-        field("ram", &format!("{} GB", info.ram_gb)),
-        field("macos", &info.macos),
-        field("uptime", &format_uptime(info.uptime_secs)),
-        field("shell", &info.shell),
-        field("font", &info.font),
-    ];
-    let mut out = String::from("\r\n");
-    if cols < 60 {
-        for line in &info_lines {
-            write!(out, "  {line}\r\n").unwrap();
-        }
+    let right = info_lines(info);
+    let (left, left_w) = if cols >= MARGIN + 44 + GAP + BOX_W {
+        (big_shark_rows(), 44)
+    } else if cols >= MARGIN + 22 + GAP + BOX_W {
+        (shark_rows(), 22)
     } else {
-        let shark = shark_rows();
-        let offset = (shark.len() - info_lines.len()) / 2;
-        for (i, row) in shark.iter().enumerate() {
-            let right = i.checked_sub(offset).and_then(|j| info_lines.get(j));
-            write!(out, "  {row}    {}\r\n", right.map_or("", |s| s.as_str())).unwrap();
-        }
+        (vec![], 0)
+    };
+    let rows = left.len().max(right.len());
+    let offset = (rows - left.len()) / 2;
+    let gap = if left_w > 0 { " ".repeat(GAP) } else { String::new() };
+    let mut out = String::from("\r\n");
+    for i in 0..rows {
+        let l = i.checked_sub(offset).and_then(|j| left.get(j)).cloned().unwrap_or_else(|| " ".repeat(left_w));
+        let r = right.get(i).map_or("", |s| s.as_str());
+        write!(out, "{}{l}{gap}{r}\r\n", " ".repeat(MARGIN)).unwrap();
     }
     out.push_str("\r\n");
     out
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
 fn sysctl_raw(name: &str) -> Option<Vec<u8>> {
@@ -158,15 +319,51 @@ fn sysctl_string(name: &str) -> Option<String> {
     Some(String::from_utf8_lossy(&raw).trim_end_matches('\0').trim().to_string())
 }
 
+/// Integer sysctl; some are 32-bit (page counts, core counts), some 64-bit.
 fn sysctl_u64(name: &str) -> Option<u64> {
     let raw = sysctl_raw(name)?;
-    Some(u64::from_ne_bytes(raw.get(..8)?.try_into().ok()?))
+    match raw.len() {
+        4 => Some(u32::from_ne_bytes(raw[..4].try_into().ok()?) as u64),
+        8 => Some(u64::from_ne_bytes(raw[..8].try_into().ok()?)),
+        _ => None,
+    }
 }
 
 fn boot_time() -> Option<u64> {
     let raw = sysctl_raw("kern.boottime")?;
     // struct timeval starts with a 64-bit tv_sec on Apple Silicon.
     Some(i64::from_ne_bytes(raw.get(..8)?.try_into().ok()?) as u64)
+}
+
+/// `vm.swapusage` is `struct xsw_usage { u64 total, avail, used; ... }`.
+fn swap_usage() -> Option<(u64, u64)> {
+    let raw = sysctl_raw("vm.swapusage")?;
+    let field = |i: usize| raw.get(i * 8..i * 8 + 8).and_then(|b| b.try_into().ok()).map(u64::from_ne_bytes);
+    Some((field(2)?, field(0)?))
+}
+
+fn disk_usage(path: &str) -> Option<(u64, u64)> {
+    let cpath = CString::new(path).ok()?;
+    // SAFETY: statfs fills the zeroed struct we own.
+    let st = unsafe {
+        let mut st: libc::statfs = std::mem::zeroed();
+        if libc::statfs(cpath.as_ptr(), &mut st) != 0 {
+            return None;
+        }
+        st
+    };
+    let total = st.f_blocks * st.f_bsize as u64;
+    Some((total - st.f_bavail * st.f_bsize as u64, total))
+}
+
+fn birth_time(path: &str) -> Option<i64> {
+    let meta = std::fs::metadata(path).ok()?;
+    meta.created().ok()?.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs() as i64)
+}
+
+fn modified_time(path: &str) -> Option<i64> {
+    let meta = std::fs::metadata(path).ok()?;
+    meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs() as i64)
 }
 
 fn full_name() -> String {
@@ -188,14 +385,33 @@ fn full_name() -> String {
 mod tests {
     use super::*;
 
+    fn visible(s: &str) -> usize {
+        // Strip SGR sequences, then count chars.
+        let mut n = 0;
+        let mut in_esc = false;
+        for c in s.chars() {
+            match (in_esc, c) {
+                (false, '\x1b') => in_esc = true,
+                (true, 'm') => in_esc = false,
+                (true, _) => {}
+                _ => n += 1,
+            }
+        }
+        n
+    }
+
     #[test]
     fn shark_is_22_by_11() {
         let rows = shark_rows();
         assert_eq!(rows.len(), 11);
-        for row in &rows {
-            let visible = row.chars().filter(|c| matches!(c, ' ' | '▀' | '▄')).count();
-            assert_eq!(visible, 22);
-        }
+        assert!(rows.iter().all(|r| visible(r) == 22));
+    }
+
+    #[test]
+    fn big_shark_is_44_by_22() {
+        let rows = big_shark_rows();
+        assert_eq!(rows.len(), 22);
+        assert!(rows.iter().all(|r| visible(r) == 44));
     }
 
     #[test]
@@ -211,24 +427,44 @@ mod tests {
     }
 
     #[test]
-    fn uptime_format() {
+    fn uptime_and_age_format() {
         assert_eq!(format_uptime(59), "0m");
         assert_eq!(format_uptime(3_660), "1h 1m");
         assert_eq!(format_uptime(90_000), "1d 1h 0m");
+        assert_eq!(format_age(10 * 86_400), "10 días");
+        assert_eq!(format_age(1_675 * 86_400), "4 años, 7 meses");
     }
 
     #[test]
-    fn narrow_banner_has_no_shark() {
-        let info = SysInfo::read(Some("Test"), "Font");
+    fn usage_colours_by_fullness() {
+        assert!(usage(95, 100).contains(&format!("{ERROR}95%")));
+        assert!(usage(75, 100).contains(&format!("{WARM}75%")));
+        assert!(usage(10, 100).contains(&format!("{ACCENT}10%")));
+    }
+
+    #[test]
+    fn section_borders_have_box_width() {
+        let s = section("Hardware", &[('x', "v".into())]);
+        assert_eq!(visible(&s[0]), BOX_W);
+        assert_eq!(visible(s.last().unwrap()), BOX_W);
+    }
+
+    #[test]
+    fn layout_degrades_with_width() {
+        let info = SysInfo::read(Some("Test"), "Font", None);
+        assert!(banner(&info, 120).contains("██"));
+        let mid = banner(&info, 80);
+        assert!(mid.contains('▀') && !mid.contains("██"));
         assert!(!banner(&info, 40).contains('▀'));
-        assert!(banner(&info, 100).contains('▀'));
     }
 
     #[test]
     fn reads_real_hardware() {
-        let info = SysInfo::read(None, "f");
-        assert!(info.chip.starts_with("Apple"), "{}", info.chip);
-        assert!(info.ram_gb >= 8);
+        let info = SysInfo::read(None, "f", None);
+        assert!(info.cpu.starts_with("Apple"), "{}", info.cpu);
+        assert!(info.memory.1 >= 8 << 30 && info.memory.0 > 0 && info.memory.0 < info.memory.1);
+        assert!(info.disk.1 > 0 && info.disk.0 > 0);
         assert!(info.uptime_secs > 0);
+        assert!(info.macos.starts_with("macOS"));
     }
 }
