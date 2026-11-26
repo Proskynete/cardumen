@@ -224,7 +224,7 @@ pub fn parse_numstat(out: &str) -> Changes {
         c.files.push(FileStat { path: path.to_string(), added, removed });
     }
     c.files.sort_by_key(|f| std::cmp::Reverse(f.added + f.removed));
-    c.files.truncate(8);
+    c.files.truncate(30);
     c
 }
 
@@ -292,35 +292,6 @@ pub fn last_text_in(jsonl: &str) -> Option<String> {
         let text = text.join("\n").trim().to_string();
         (!text.is_empty()).then_some(text)
     })
-}
-
-/// Hard-wrap to `width` columns, keeping paragraph breaks.
-pub fn wrap(text: &str, width: usize) -> Vec<String> {
-    let width = width.max(1);
-    let mut out = vec![];
-    for para in text.lines() {
-        let mut line = String::new();
-        for word in para.split_whitespace() {
-            let needed = line.chars().count() + usize::from(!line.is_empty()) + word.chars().count();
-            if needed > width && !line.is_empty() {
-                out.push(std::mem::take(&mut line));
-            }
-            if !line.is_empty() {
-                line.push(' ');
-            }
-            line.push_str(word);
-            while line.chars().count() > width {
-                let rest: String = line.chars().skip(width).collect();
-                out.push(line.chars().take(width).collect());
-                line = rest;
-            }
-        }
-        out.push(line);
-    }
-    while out.last().is_some_and(String::is_empty) {
-        out.pop();
-    }
-    out
 }
 
 /// Run a command with stdin closed and a timeout; `Err` carries a short reason.
@@ -566,10 +537,4 @@ mod tests {
         assert_eq!(last_text_in(&jsonl).unwrap(), "Listo. ¿Hago el PR?");
     }
 
-    #[test]
-    fn wrapping() {
-        assert_eq!(wrap("uno dos tres cuatro", 8), ["uno dos", "tres", "cuatro"]);
-        assert_eq!(wrap("abcdefghij", 4), ["abcd", "efgh", "ij"]);
-        assert_eq!(wrap("a\n\nb\n", 10), ["a", "", "b"]);
-    }
 }

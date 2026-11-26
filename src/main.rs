@@ -31,6 +31,7 @@ use winit::window::{Window, WindowId};
 use config::Config;
 use font::Fonts;
 use layout::{Arrow, Dir, PaneId, Rect, Tabs};
+use font::Face;
 use renderer::{Chrome, Frame, Renderer};
 use session::{Listener, Session, UserEvent};
 use theme::Rgb;
@@ -44,17 +45,22 @@ const TAB_PAD: f32 = 12.0;
 const PLUS_W: f32 = 28.0;
 /// Inner padding of each pane.
 const PAD: f32 = 8.0;
-const DIVIDER: f32 = 1.0;
+const DIVIDER: f32 = 8.0;
+const GUTTER_W: f32 = 8.0;
+const HEADER_H: f32 = 28.0;
 
 const HAIRLINE: Rgb = [0x1F, 0x33, 0x3D];
 const SIDEBAR_W: f32 = 230.0;
 const PANEL_W: f32 = 320.0;
 const MERGED: Rgb = [0xC3, 0x8F, 0xD9];
 const ERROR: Rgb = [0xE1, 0x57, 0x57];
-const SIDEBAR_BG: Rgb = [0x0C, 0x17, 0x1D];
+const PANEL: Rgb = [0x0C, 0x17, 0x1D];
+const GUTTER: Rgb = [0x06, 0x0D, 0x11];
+const SELECTED: Rgb = [0x13, 0x25, 0x2E];
+const CARD: Rgb = [0x0F, 0x1E, 0x25];
+const BODY: Rgb = [0xC9, 0xD6, 0xD8];
 const WARM: Rgb = [0xF2, 0xA6, 0x5A];
 const SUCCESS: Rgb = [0x4F, 0xB4, 0x77];
-const TAB_BG: Rgb = [0x0F, 0x1F, 0x27];
 
 const BLINK: Duration = Duration::from_millis(530);
 const MULTI_CLICK: Duration = Duration::from_millis(400);
@@ -68,6 +74,11 @@ struct Pane {
     /// What Claude asked permission for, while waiting.
     ask: Option<String>,
     last_message: Option<String>,
+}
+
+enum UiHit {
+    PanelTab(bool),
+    ClosePane(PaneId),
 }
 
 enum TabHit {
@@ -111,6 +122,8 @@ struct State {
     sidebar_hits: Vec<(Rect, PaneId)>,
     next_tick: Instant,
     panel: bool,
+    panel_changes: bool,
+    ui_hits: Vec<(Rect, UiHit)>,
     ctx_tx: std::sync::mpsc::Sender<context::Request>,
 }
 
@@ -144,9 +157,11 @@ impl State {
 
     fn content_rect(&self) -> Rect {
         let size = self.window.inner_size();
-        let (top, left) = (BAR_H * self.scale(), self.sidebar_w());
-        let w = size.width as f32 - left - self.panel_w();
-        Rect { x: left, y: top, w: w.max(1.0), h: (size.height as f32 - top).max(1.0) }
+        let s = self.scale();
+        // The gutter around the pane cards.
+        let (top, left) = (BAR_H * s, self.sidebar_w() + GUTTER_W * s);
+        let w = size.width as f32 - left - self.panel_w() - GUTTER_W * s;
+        Rect { x: left, y: top, w: w.max(1.0), h: (size.height as f32 - top - GUTTER_W * s).max(1.0) }
     }
 
     /// Tell the context worker which shells exist.
@@ -162,19 +177,20 @@ impl State {
     }
 
     fn grid_size(&self, r: Rect) -> WindowSize {
-        let pad = 2.0 * PAD * self.scale();
+        let s = self.scale();
         let (cw, ch) = (self.fonts.cell_w, self.fonts.cell_h);
         WindowSize {
-            num_cols: ((r.w - pad) / cw).floor().max(2.0) as u16,
-            num_lines: ((r.h - pad) / ch).floor().max(1.0) as u16,
+            num_cols: ((r.w - 2.0 * PAD * s) / cw).floor().max(2.0) as u16,
+            num_lines: ((r.h - (HEADER_H + PAD) * s) / ch).floor().max(1.0) as u16,
             cell_width: cw as u16,
             cell_height: ch as u16,
         }
     }
 
+    /// Terminal grid starts under the pane header.
     fn grid_origin(&self, r: Rect) -> (f32, f32) {
-        let pad = PAD * self.scale();
-        (r.x + pad, r.y + pad)
+        let s = self.scale();
+        (r.x + PAD * s, r.y + HEADER_H * s)
     }
 
     fn tab_layout(&self, tab: usize) -> (Vec<(PaneId, Rect)>, Vec<Rect>) {
@@ -336,22 +352,18 @@ impl State {
             .any(|id| self.panes.get(id).and_then(|p| p.claude).is_some_and(|c| c.claude == status::Claude::Waiting))
     }
 
-    /// Sidebar: summary line, then panes grouped by project with their Claude state.
+    /// Sidebar: summary pills, then panes grouped by project with their Claude state.
     fn sidebar_chrome(&mut self, out: &mut Vec<Chrome>) {
         self.sidebar_hits.clear();
         if !self.sidebar {
             return;
         }
         let s = self.scale();
-        let (cw, ch) = (self.fonts.cell_w, self.fonts.cell_h);
         let (w, height) = (self.sidebar_w(), self.window.inner_size().height as f32);
-        out.push(Chrome::Rect { rect: Rect { x: 0.0, y: 0.0, w, h: height }, color: SIDEBAR_BG });
+        out.push(Chrome::Rect { rect: Rect { x: 0.0, y: 0.0, w, h: height }, color: PANEL });
         out.push(Chrome::Rect { rect: Rect { x: w - s, y: 0.0, w: s, h: height }, color: HAIRLINE });
-        let left = 14.0 * s;
-        let text_w = w - 2.0 * left;
-        let line = ch + 4.0 * s;
 
-        // (project, pane id, tab index) in tab order, grouped by first appearance.
+        // (project, pane id, tab index), grouped by first appearance in tab order.
         let mut groups: Vec<(String, Vec<(PaneId, usize)>)> = vec![];
         for (i, tab) in self.tabs.list.iter().enumerate() {
             for id in tab.root.leaves() {
@@ -365,153 +377,235 @@ impl State {
         let count = |c: status::Claude| self.panes.values().filter(|p| p.claude.is_some_and(|x| x.claude == c)).count();
         let (waiting, working) = (count(status::Claude::Waiting), count(status::Claude::Working));
 
-        let mut y = BAR_H * s + 6.0 * s;
-        out.push(Chrome::Text { x: left, y, text: format!("● {waiting} te esperan"), color: if waiting > 0 { WARM } else { theme::MUTED }, max_w: text_w });
-        y += line;
-        out.push(Chrome::Text { x: left, y, text: format!("● {working} trabajando"), color: if working > 0 { theme::ACCENT } else { theme::MUTED }, max_w: text_w });
-        y += line + 10.0 * s;
+        let mut y = BAR_H * s + 2.0 * s;
+        let mut x = 14.0 * s;
+        for (n, label, color) in [(waiting, "te espera", WARM), (working, "trabajando", theme::ACCENT)] {
+            let color = if n > 0 { color } else { theme::MUTED };
+            x += self.pill(out, x, y, &format!("{n} {label}"), color, PANEL) + 6.0 * s;
+        }
+        y += 34.0 * s;
 
         let focused = self.focused_id();
+        let row_w = w - 16.0 * s;
         for (project, rows) in groups {
             if y > height {
                 break;
             }
-            out.push(Chrome::Text { x: left, y, text: project, color: theme::MUTED, max_w: text_w });
-            y += line;
+            out.push(label(18.0 * s, y, project.to_uppercase(), Face::Sans, 10.5 * s, true, theme::MUTED, row_w));
+            y += 20.0 * s;
             for (id, tab) in rows {
-                let row = Rect { x: 6.0 * s, y: y - 3.0 * s, w: w - 12.0 * s, h: 3.0 * line + 2.0 * s };
+                let row = Rect { x: 8.0 * s, y, w: row_w, h: 62.0 * s };
                 if id == focused {
-                    out.push(Chrome::Rect { rect: row, color: TAB_BG });
+                    out.push(Chrome::Round { rect: row, radius: 10.0 * s, color: SELECTED });
                 }
-                let state = self.panes.get(&id).and_then(|p| p.claude);
+                let pane = self.panes.get(&id);
+                let state = pane.and_then(|p| p.claude);
+                let ctx = pane.and_then(|p| p.ctx.as_deref());
                 let (dot, detail) = match state {
                     Some(st) => match st.claude {
                         status::Claude::Waiting => (WARM, format!("te espera · {}", status::elapsed(st.since))),
                         status::Claude::Working => (theme::ACCENT, format!("trabajando · {}", status::elapsed(st.since))),
                         status::Claude::Done => (SUCCESS, format!("lista · {}", status::elapsed(st.since))),
                     },
-                    None => (theme::MUTED, folder_name(self.panes.get(&id).and_then(|p| p.session.cwd()))),
+                    None => (theme::MUTED, "sin Claude".into()),
                 };
-                let label = self.tabs.list[tab].name.clone().unwrap_or_else(|| self.pane_label(id));
-                out.push(Chrome::Text { x: left, y, text: "●".into(), color: dot, max_w: cw });
-                out.push(Chrome::Text { x: left + 2.0 * cw, y, text: label, color: theme::FOREGROUND, max_w: text_w - 2.0 * cw });
-                out.push(Chrome::Text { x: left + 2.0 * cw, y: y + line, text: detail, color: if state.is_some() { dot } else { theme::MUTED }, max_w: text_w - 2.0 * cw });
-                if let Some(ctx) = self.panes.get(&id).and_then(|p| p.ctx.as_deref()) {
-                    let mut third = ctx.step().label();
-                    if let context::PrInfo::Found(pr) = &ctx.pr {
-                        third.push_str(&format!(" · {}", pr.number));
-                    }
-                    out.push(Chrome::Text { x: left + 2.0 * cw, y: y + 2.0 * line, text: third, color: theme::MUTED, max_w: text_w - 2.0 * cw });
+                let badge = match (state.map(|s| s.claude), ctx) {
+                    (Some(status::Claude::Waiting), _) => Some(("te toca".to_string(), WARM)),
+                    (_, Some(c)) => Some((c.step().label(), theme::MUTED)),
+                    _ => None,
+                };
+                let mut meta = ctx.and_then(|c| c.branch.clone()).unwrap_or_else(|| folder_name(pane.and_then(|p| p.session.cwd())));
+                if let Some(context::PrInfo::Found(pr)) = ctx.map(|c| &c.pr) {
+                    meta.push_str(&format!(" · {}", pr.number));
                 }
-                let row = Rect { h: 3.0 * line + 2.0 * s, ..row };
+                let title = self.tabs.list[tab].name.clone().unwrap_or_else(|| self.pane_label(id));
+
+                let text_x = row.x + 24.0 * s;
+                let text_w = row.x + row.w - 10.0 * s - text_x;
+                out.push(Chrome::Round { rect: Rect { x: row.x + 10.0 * s, y: y + 9.0 * s, w: 7.0 * s, h: 7.0 * s }, radius: 3.5 * s, color: dot });
+                let badge_w = badge.as_ref().map_or(0.0, |(t, _)| self.fonts.run(t, Face::Sans, 10.5 * s, true).width + 18.0 * s);
+                let title_w = self.fonts.run(&title, Face::Sans, 13.0 * s, true).width.min(text_w - badge_w);
+                out.push(label(text_x, y + 3.0 * s, title, Face::Sans, 13.0 * s, true, theme::FOREGROUND, text_w - badge_w));
+                if let Some((t, c)) = badge {
+                    self.pill(out, text_x + title_w + 6.0 * s, y + 4.0 * s, &t, c, if id == focused { SELECTED } else { PANEL });
+                }
+                out.push(label(text_x, y + 22.0 * s, detail, Face::Sans, 12.0 * s, false, if state.is_some() { dot } else { theme::MUTED }, text_w));
+                out.push(label(text_x, y + 40.0 * s, "\u{e0a0}".into(), Face::Mono, 11.0 * s, false, theme::MUTED, 14.0 * s));
+                out.push(label(text_x + 14.0 * s, y + 40.0 * s, meta, Face::Sans, 11.5 * s, false, theme::MUTED, text_w - 14.0 * s));
                 self.sidebar_hits.push((row, id));
-                y += 3.0 * line + 8.0 * s;
+                y += 66.0 * s;
             }
-            y += 6.0 * s;
+            y += 8.0 * s;
         }
     }
 
+    /// A tinted rounded badge with `text`; returns its width.
+    fn pill(&mut self, out: &mut Vec<Chrome>, x: f32, y: f32, text: &str, color: Rgb, on: Rgb) -> f32 {
+        let s = self.scale();
+        let px = 10.5 * s;
+        let w = self.fonts.run(text, Face::Sans, px, true).width + 14.0 * s;
+        let h = 18.0 * s;
+        out.push(Chrome::Round { rect: Rect { x, y, w, h }, radius: 6.0 * s, color: mix(color, on, 0.16) });
+        out.push(label(x + 7.0 * s, y + (h - px * 1.3) / 2.0, text.into(), Face::Sans, px, true, color, w));
+        w
+    }
+
+    /// Greedy word wrap by measured width.
+    fn wrap_px(&mut self, text: &str, px: f32, max_w: f32) -> Vec<String> {
+        let mut lines = vec![];
+        for para in text.lines() {
+            let mut line = String::new();
+            for word in para.split_whitespace() {
+                let candidate = if line.is_empty() { word.to_string() } else { format!("{line} {word}") };
+                if !line.is_empty() && self.fonts.run(&candidate, Face::Sans, px, false).width > max_w {
+                    lines.push(std::mem::replace(&mut line, word.to_string()));
+                } else {
+                    line = candidate;
+                }
+            }
+            lines.push(line);
+        }
+        while lines.last().is_some_and(String::is_empty) {
+            lines.pop();
+        }
+        lines
+    }
+
     /// Right "Resumen" panel for the focused pane: step, Claude, PR/MR, changes.
-    fn panel_chrome(&self, out: &mut Vec<Chrome>) {
+    fn panel_chrome(&mut self, out: &mut Vec<Chrome>) {
         let pw = self.panel_w();
         if pw == 0.0 {
             return;
         }
         let s = self.scale();
-        let (cw, ch) = (self.fonts.cell_w, self.fonts.cell_h);
         let size = self.window.inner_size();
         let (x0, height) = (size.width as f32 - pw, size.height as f32);
-        out.push(Chrome::Rect { rect: Rect { x: x0, y: 0.0, w: pw, h: height }, color: SIDEBAR_BG });
+        out.push(Chrome::Rect { rect: Rect { x: x0, y: 0.0, w: pw, h: height }, color: PANEL });
         out.push(Chrome::Rect { rect: Rect { x: x0, y: 0.0, w: s, h: height }, color: HAIRLINE });
-        let left = x0 + 16.0 * s;
-        let text_w = pw - 32.0 * s;
-        let cols = (text_w / cw).floor().max(1.0) as usize;
-        let line = ch + 4.0 * s;
-        let mut y = BAR_H * s + 6.0 * s;
-        let text = |out: &mut Vec<Chrome>, y: &mut f32, x: f32, t: String, color: Rgb| {
-            if *y < height {
-                out.push(Chrome::Text { x, y: *y, text: t, color, max_w: left + text_w - x });
-            }
-            *y += line;
-        };
+        let left = x0 + 18.0 * s;
+        let tw = pw - 36.0 * s;
         let id = self.focused_id();
         let Some(pane) = self.panes.get(&id) else { return };
-        let label = self.tabs.active().name.clone().unwrap_or_else(|| self.pane_label(id));
-        text(out, &mut y, left, label, theme::FOREGROUND);
-        let ctx = pane.ctx.as_deref();
-        match ctx.and_then(|c| c.branch.clone()) {
-            Some(b) => text(out, &mut y, left, format!("\u{e0a0} {b}"), theme::MUTED),
-            None => text(out, &mut y, left, "fuera de un repo git".into(), theme::MUTED),
-        }
-        y += 8.0 * s;
+        let title = self.tabs.active().name.clone().unwrap_or_else(|| self.pane_label(id));
+        let ctx = pane.ctx.clone();
+        let (claude, ask, last) = (pane.claude.map(|c| c.claude), pane.ask.clone(), pane.last_message.clone());
 
-        let section = |out: &mut Vec<Chrome>, y: &mut f32, title: &str| {
-            *y += 6.0 * s;
-            out.push(Chrome::Rect { rect: Rect { x: left, y: *y - 6.0 * s, w: text_w, h: s }, color: HAIRLINE });
-            out.push(Chrome::Text { x: left, y: *y, text: title.into(), color: theme::ACCENT, max_w: text_w });
-            *y += line + 2.0 * s;
+        let mut y = BAR_H * s;
+        out.push(label(left, y, title, Face::Sans, 16.0 * s, true, theme::FOREGROUND, tw));
+        y += 30.0 * s;
+        // Resumen / Cambios switch.
+        let mut x = left;
+        for (name, changes) in [("Resumen", false), ("Cambios", true)] {
+            let on = self.panel_changes == changes;
+            let w = self.fonts.run(name, Face::Sans, 12.5 * s, on).width;
+            out.push(label(x, y, name.into(), Face::Sans, 12.5 * s, on, if on { theme::FOREGROUND } else { theme::MUTED }, w + s));
+            if on {
+                out.push(Chrome::Round { rect: Rect { x, y: y + 21.0 * s, w, h: 2.0 * s }, radius: s, color: theme::ACCENT });
+            }
+            self.ui_hits.push((Rect { x: x - 4.0 * s, y: y - 4.0 * s, w: w + 8.0 * s, h: 28.0 * s }, UiHit::PanelTab(changes)));
+            x += w + 18.0 * s;
+        }
+        y += 23.0 * s;
+        out.push(Chrome::Rect { rect: Rect { x: x0, y, w: pw, h: s }, color: HAIRLINE });
+        y += 14.0 * s;
+
+        let section = |out: &mut Vec<Chrome>, y: &mut f32, t: &str| {
+            out.push(label(left, *y, t.to_uppercase(), Face::Sans, 10.5 * s, true, theme::MUTED, tw));
+            *y += 20.0 * s;
+        };
+        let Some(ctx) = ctx else {
+            out.push(label(left, y, "Fuera de un repo git".into(), Face::Sans, 12.5 * s, false, theme::MUTED, tw));
+            return;
         };
 
-        if let Some(ctx) = ctx {
-            section(out, &mut y, "Paso");
-            let step = ctx.step();
-            let stages: Vec<(usize, String)> = [
-                (0, "Spec".to_string()),
-                (1, match (step, &ctx.spec) {
-                    (context::Step::Tasks(d, t), _) => format!("Tareas {d}/{t}"),
-                    (_, Some(sp)) if sp.total > 0 => format!("Tareas {}/{}", sp.done, sp.total),
-                    _ => "Tareas".into(),
-                }),
-                (2, "PR / MR".into()),
-                (3, "Review".into()),
-                (4, "Merge".into()),
-            ]
-            .into_iter()
-            .filter(|(k, _)| ctx.spec.is_some() || *k >= 2)
-            .collect();
-            for (k, name) in stages {
-                let cur = step.index();
-                let (mark, color, tcolor) = match k.cmp(&cur) {
-                    std::cmp::Ordering::Less => ("✓", SUCCESS, theme::MUTED),
-                    std::cmp::Ordering::Equal => ("●", theme::ACCENT, theme::FOREGROUND),
-                    std::cmp::Ordering::Greater => ("○", theme::MUTED, theme::MUTED),
-                };
-                if y < height {
-                    out.push(Chrome::Text { x: left, y, text: mark.into(), color, max_w: cw });
-                }
-                text(out, &mut y, left + 2.0 * cw, name, tcolor);
-            }
-            if let Some(sp) = &ctx.spec {
-                text(out, &mut y, left, format!("openspec · {}", sp.change), theme::MUTED);
-            }
+        if self.panel_changes {
+            self.changes_list(out, &ctx, left, tw, y, height, 30);
+            return;
         }
 
+        // Paso: rail with circles.
+        section(out, &mut y, "Paso");
+        let step = ctx.step();
+        let stages: Vec<(usize, String)> = [
+            (0, "Spec".to_string()),
+            (1, match (step, &ctx.spec) {
+                (context::Step::Tasks(d, t), _) => format!("Tareas {d}/{t}"),
+                (_, Some(sp)) if sp.total > 0 => format!("{}/{}", sp.done, sp.total),
+                _ => "Tareas".into(),
+            }),
+            (2, "PR".into()),
+            (3, "Review".into()),
+            (4, "Merge".into()),
+        ]
+        .into_iter()
+        .filter(|(k, _)| ctx.spec.is_some() || *k >= 2)
+        .collect();
+        let n = stages.len();
+        let (inset, cy) = (16.0 * s, y + 10.0 * s);
+        let gap = (tw - 2.0 * inset) / (n.max(2) - 1) as f32;
+        let cur = stages.iter().position(|(k, _)| *k == step.index()).unwrap_or(0);
+        out.push(Chrome::Rect { rect: Rect { x: left + inset, y: cy - s, w: tw - 2.0 * inset, h: 2.0 * s }, color: HAIRLINE });
+        out.push(Chrome::Rect { rect: Rect { x: left + inset, y: cy - s, w: gap * cur as f32, h: 2.0 * s }, color: SUCCESS });
+        for (i, (_, name)) in stages.iter().enumerate() {
+            let cx = left + inset + gap * i as f32;
+            let circle = |d: f32, color: Rgb| Chrome::Round { rect: Rect { x: cx - d / 2.0, y: cy - d / 2.0, w: d, h: d }, radius: d / 2.0, color };
+            match i.cmp(&cur) {
+                std::cmp::Ordering::Less => out.push(circle(14.0 * s, SUCCESS)),
+                std::cmp::Ordering::Equal => {
+                    out.push(circle(24.0 * s, mix(theme::ACCENT, PANEL, 0.18)));
+                    out.push(circle(14.0 * s, theme::ACCENT));
+                    out.push(circle(9.0 * s, PANEL));
+                }
+                std::cmp::Ordering::Greater => {
+                    out.push(circle(14.0 * s, HAIRLINE));
+                    out.push(circle(10.0 * s, PANEL));
+                }
+            }
+            let px = 10.5 * s;
+            let lw = self.fonts.run(name, Face::Sans, px, i == cur).width;
+            let color = if i == cur { theme::FOREGROUND } else { theme::MUTED };
+            out.push(label(cx - lw / 2.0, cy + 14.0 * s, name.clone(), Face::Sans, px, i == cur, color, lw + s));
+        }
+        y += 50.0 * s;
+        if let Some(sp) = &ctx.spec {
+            out.push(label(left, y, format!("openspec · {}", sp.change), Face::Sans, 11.5 * s, false, theme::MUTED, tw));
+            y += 24.0 * s;
+        }
+
+        // Claude.
         section(out, &mut y, "Claude");
-        match (pane.claude.map(|c| c.claude), &pane.ask, &pane.last_message) {
-            (Some(status::Claude::Waiting), ask, _) => {
-                text(out, &mut y, left, "te espera".into(), WARM);
-                if let Some(ask) = ask {
-                    for l in context::wrap(&format!("pide permiso: {ask}"), cols).into_iter().take(6) {
-                        text(out, &mut y, left, l, theme::FOREGROUND);
-                    }
-                }
+        let body_px = 12.5 * s;
+        let line_h = 18.0 * s;
+        let (pill, text) = match (claude, ask, last) {
+            (Some(status::Claude::Waiting), ask, _) => (Some(("te espera", WARM)), ask.map(|a| format!("Pide permiso: {a}"))),
+            (_, _, Some(msg)) => (None, Some(msg)),
+            (Some(status::Claude::Done), _, None) => (Some(("lista", SUCCESS)), None),
+            (Some(_), _, None) => (Some(("trabajando", theme::ACCENT)), None),
+            (None, _, None) => (None, Some("Sin sesión de Claude en este panel.".into())),
+        };
+        let mut lines = text.map(|t| self.wrap_px(&t, body_px, tw - 24.0 * s)).unwrap_or_default();
+        let cut = lines.len() > 8;
+        lines.truncate(8);
+        if cut {
+            if let Some(l) = lines.last_mut() {
+                l.push('…');
             }
-            (_, _, Some(msg)) => {
-                let lines = context::wrap(msg, cols);
-                let more = lines.len() > 12;
-                for l in lines.into_iter().take(12) {
-                    text(out, &mut y, left, l, theme::FOREGROUND);
-                }
-                if more {
-                    text(out, &mut y, left, "…".into(), theme::MUTED);
-                }
-            }
-            (Some(_), _, None) => text(out, &mut y, left, "trabajando…".into(), theme::ACCENT),
-            (None, _, None) => text(out, &mut y, left, "sin sesión de Claude".into(), theme::MUTED),
         }
+        let card_h = 20.0 * s + lines.len() as f32 * line_h + if pill.is_some() { 24.0 * s } else { 0.0 };
+        out.push(Chrome::Round { rect: Rect { x: left, y, w: tw, h: card_h }, radius: 12.0 * s, color: CARD });
+        let mut cy = y + 10.0 * s;
+        if let Some((t, c)) = pill {
+            self.pill(out, left + 12.0 * s, cy, t, c, CARD);
+            cy += 24.0 * s;
+        }
+        for l in lines {
+            out.push(label(left + 12.0 * s, cy, l, Face::Sans, body_px, false, BODY, tw - 24.0 * s));
+            cy += line_h;
+        }
+        y += card_h + 16.0 * s;
 
-        let Some(ctx) = ctx else { return };
-        section(out, &mut y, if ctx.provider == Some(context::Provider::GitLab) { "MR" } else { "PR" });
+        // PR / MR.
+        section(out, &mut y, if ctx.provider == Some(context::Provider::GitLab) { "Merge request" } else { "Pull request" });
         match &ctx.pr {
             context::PrInfo::Found(pr) => {
                 let color = match pr.state {
@@ -522,45 +616,77 @@ impl State {
                     context::PrState::Merged => MERGED,
                     context::PrState::Closed => ERROR,
                 };
-                text(out, &mut y, left, format!("{} {}", pr.number, pr.state.label()), color);
-                for l in context::wrap(&pr.title, cols).into_iter().take(2) {
-                    text(out, &mut y, left, l, theme::FOREGROUND);
+                let mut lines = self.wrap_px(&pr.title, body_px, tw - 24.0 * s);
+                lines.truncate(2);
+                let card_h = 20.0 * s + 24.0 * s + lines.len() as f32 * line_h;
+                out.push(Chrome::Round { rect: Rect { x: left, y, w: tw, h: card_h }, radius: 12.0 * s, color: CARD });
+                self.pill(out, left + 12.0 * s, y + 10.0 * s, &format!("{} {}", pr.number, pr.state.label()), color, CARD);
+                let mut cy = y + 34.0 * s;
+                for l in lines {
+                    out.push(label(left + 12.0 * s, cy, l, Face::Sans, body_px, false, theme::FOREGROUND, tw - 24.0 * s));
+                    cy += line_h;
                 }
+                y += card_h + 16.0 * s;
             }
-            context::PrInfo::None => text(out, &mut y, left, "sin PR/MR para esta rama".into(), theme::MUTED),
-            context::PrInfo::Error(e) => {
-                for l in context::wrap(e, cols).into_iter().take(2) {
-                    text(out, &mut y, left, l, theme::MUTED);
-                }
+            other => {
+                let msg = match other {
+                    context::PrInfo::None => "Sin PR/MR para esta rama".to_string(),
+                    context::PrInfo::Error(e) => e.clone(),
+                    _ => "Remote sin GitHub/GitLab".to_string(),
+                };
+                out.push(label(left, y, msg, Face::Sans, 12.0 * s, false, theme::MUTED, tw));
+                y += 30.0 * s;
             }
-            context::PrInfo::Unknown => text(out, &mut y, left, "remote sin GitHub/GitLab".into(), theme::MUTED),
         }
 
         section(out, &mut y, "Cambios");
-        match &ctx.changes {
-            Some(c) if c.total_files > 0 => {
-                let unit = if c.total_files == 1 { "archivo" } else { "archivos" };
-                text(out, &mut y, left, format!("{} {unit} · +{} −{}", c.total_files, c.added, c.removed), theme::FOREGROUND);
-                if let Some(n) = c.unpushed.filter(|n| *n > 0) {
-                    text(out, &mut y, left, format!("{n} commits sin push"), WARM);
-                }
-                for f in &c.files {
-                    let plus = format!("+{}", f.added);
-                    let minus = format!("−{}", f.removed);
-                    let path_x = left + 12.0 * cw;
-                    let fit = ((left + text_w - path_x) / cw).floor().max(1.0) as usize;
-                    let n = f.path.chars().count();
-                    // Keep the end of long paths: the file name matters most.
-                    let path = if n > fit { format!("…{}", f.path.chars().skip(n + 1 - fit).collect::<String>()) } else { f.path.clone() };
-                    if y < height {
-                        out.push(Chrome::Text { x: left, y, text: plus, color: SUCCESS, max_w: 6.0 * cw });
-                        out.push(Chrome::Text { x: left + 6.0 * cw, y, text: minus, color: ERROR, max_w: 6.0 * cw });
-                    }
-                    text(out, &mut y, path_x, path, theme::MUTED);
-                }
+        self.changes_list(out, &ctx, left, tw, y, height, 3);
+    }
+
+    /// Change summary plus up to `limit` files.
+    #[allow(clippy::too_many_arguments)]
+    fn changes_list(&mut self, out: &mut Vec<Chrome>, ctx: &context::Context, left: f32, tw: f32, mut y: f32, height: f32, limit: usize) {
+        let s = self.scale();
+        let Some(c) = &ctx.changes else {
+            out.push(label(left, y, "—".into(), Face::Sans, 12.0 * s, false, theme::MUTED, tw));
+            return;
+        };
+        if c.total_files == 0 {
+            out.push(label(left, y, "Sin cambios".into(), Face::Sans, 12.0 * s, false, theme::MUTED, tw));
+            return;
+        }
+        let px = 12.5 * s;
+        let unit = if c.total_files == 1 { "archivo" } else { "archivos" };
+        let mut x = left;
+        for (t, color, bold) in [
+            (format!("{} {unit}", c.total_files), theme::FOREGROUND, true),
+            (format!("+{}", c.added), SUCCESS, true),
+            (format!("−{}", c.removed), ERROR, true),
+        ] {
+            let w = self.fonts.run(&t, Face::Sans, px, bold).width;
+            out.push(label(x, y, t, Face::Sans, px, bold, color, w + s));
+            x += w + 8.0 * s;
+        }
+        y += 22.0 * s;
+        if let Some(n) = c.unpushed.filter(|n| *n > 0) {
+            out.push(label(left, y, format!("{n} commits sin push"), Face::Sans, 12.0 * s, false, WARM, tw));
+            y += 22.0 * s;
+        }
+        let mpx = 11.5 * s;
+        for f in c.files.iter().take(limit) {
+            if y > height {
+                break;
             }
-            Some(_) => text(out, &mut y, left, "sin cambios".into(), theme::MUTED),
-            None => text(out, &mut y, left, "—".into(), theme::MUTED),
+            out.push(label(left, y, format!("+{}", f.added), Face::Mono, mpx, false, SUCCESS, 44.0 * s));
+            out.push(label(left + 44.0 * s, y, format!("−{}", f.removed), Face::Mono, mpx, false, ERROR, 40.0 * s));
+            // Keep the end of long paths: the file name matters most.
+            let path_w = tw - 86.0 * s;
+            let mut path = f.path.clone();
+            while path.chars().count() > 1 && self.fonts.run(&path, Face::Mono, mpx, false).width > path_w {
+                path = format!("…{}", path.chars().skip(2).collect::<String>());
+            }
+            out.push(label(left + 86.0 * s, y, path, Face::Mono, mpx, false, theme::MUTED, path_w));
+            y += 20.0 * s;
         }
     }
 
@@ -580,24 +706,25 @@ impl State {
         }
     }
 
-    /// Tab bar and dividers. Also records tab hit-boxes for clicks.
+    /// Everything around the terminals: sidebar, panel, pill tabs, pane cards.
+    /// Also records hit-boxes for clicks.
     fn chrome(&mut self) -> Vec<Chrome> {
         let s = self.scale();
         let width = self.window.inner_size().width as f32;
-        let (cw, ch) = (self.fonts.cell_w, self.fonts.cell_h);
-        let mut out = vec![Chrome::Rect {
-            rect: Rect { x: 0.0, y: BAR_H * s - s, w: width, h: s },
-            color: HAIRLINE,
-        }];
+        let mut out = vec![];
+        self.ui_hits.clear();
         self.sidebar_chrome(&mut out);
         self.panel_chrome(&mut out);
+        self.panes_chrome(&mut out);
+
         self.tab_hits.clear();
         let n = self.tabs.list.len() as f32;
         let room = width - self.panel_w() - self.tabs_x() - PLUS_W * s - 2.0 * PAD * s;
         let tab_w = (room / n).min(TAB_MAX_W * s).floor();
         self.tab_w = tab_w;
-        let (top, h) = (5.0 * s, BAR_H * s - 6.0 * s);
-        let text_y = top + ((h - ch) / 2.0).round();
+        let (top, h) = (6.0 * s, BAR_H * s - 10.0 * s);
+        let px = 12.5 * s;
+        let text_y = top + (h - px * 1.3) / 2.0;
         let mut dragged_chrome = vec![];
         self.animating = false;
         let first_x = self.tabs_x();
@@ -622,47 +749,39 @@ impl State {
             };
             self.tab_x.insert(tab_id, x);
             let first = out.len();
-            let rect = Rect { x, y: top, w: tab_w - 2.0 * s, h };
+            let rect = Rect { x, y: top, w: tab_w - 4.0 * s, h };
             let slot = Rect { x: slot_x, ..rect };
             let active = i == self.tabs.active;
-            if active {
-                out.push(Chrome::Rect { rect, color: TAB_BG });
-                out.push(Chrome::Rect {
-                    rect: Rect { x, y: top + h - 2.0 * s, w: rect.w, h: 2.0 * s },
-                    color: theme::ACCENT,
-                });
+            let hovered = self.hovered_tab == Some(i);
+            if active || drag.is_some() {
+                out.push(Chrome::Round { rect, radius: 8.0 * s, color: SELECTED });
+            } else if hovered {
+                out.push(Chrome::Round { rect, radius: 8.0 * s, color: CARD });
             }
-            let show_close = active || self.hovered_tab == Some(i);
-            let close_w = cw + 8.0 * s;
-            let max_w = rect.w - 2.0 * TAB_PAD * s - if show_close { close_w } else { 0.0 };
+            let show_close = active || hovered;
+            let close_w = 22.0 * s;
+            let mut text_x = x + TAB_PAD * s;
+            let mut max_w = rect.w - 2.0 * TAB_PAD * s - if show_close { close_w } else { 0.0 };
             let (text, editing) = match &self.renaming {
                 Some((j, buf)) if *j == i => (buf.clone(), true),
                 _ => (self.tab_title(i), false),
             };
+            if !editing && self.tab_waiting(i) {
+                out.push(Chrome::Round { rect: Rect { x: text_x, y: top + h / 2.0 - 3.5 * s, w: 7.0 * s, h: 7.0 * s }, radius: 3.5 * s, color: WARM });
+                text_x += 13.0 * s;
+                max_w -= 13.0 * s;
+            }
             if editing {
                 // Caret after the text (clamped to the tab), in the accent colour.
-                let caret_x = x + TAB_PAD * s + (text.chars().count() as f32 * cw).min(max_w);
-                out.push(Chrome::Rect { rect: Rect { x: caret_x, y: text_y, w: 2.0 * s, h: ch }, color: theme::ACCENT });
+                let tw = self.fonts.run(&text, Face::Sans, px, false).width.min(max_w);
+                out.push(Chrome::Rect { rect: Rect { x: text_x + tw + s, y: text_y, w: 2.0 * s, h: px * 1.3 }, color: theme::ACCENT });
             }
-            let mut text_x = x + TAB_PAD * s;
-            let mut max_w = max_w;
-            if !editing && self.tab_waiting(i) {
-                out.push(Chrome::Text { x: text_x, y: text_y, text: "●".into(), color: WARM, max_w: cw });
-                text_x += 2.0 * cw;
-                max_w -= 2.0 * cw;
-            }
-            out.push(Chrome::Text {
-                x: text_x,
-                y: text_y,
-                text,
-                color: if active { theme::FOREGROUND } else { theme::MUTED },
-                max_w,
-            });
+            out.push(label(text_x, text_y, text, Face::Sans, px, active, if active { theme::FOREGROUND } else { theme::MUTED }, max_w));
             if show_close {
-                let cx = x + rect.w - TAB_PAD * s / 2.0 - close_w;
-                out.push(Chrome::Text { x: cx + 4.0 * s, y: text_y, text: "×".into(), color: theme::MUTED, max_w: cw });
+                let cx = x + rect.w - close_w - 4.0 * s;
+                out.push(label(cx + 6.0 * s, top + (h - 14.0 * s * 1.3) / 2.0, "×".into(), Face::Sans, 14.0 * s, false, theme::MUTED, close_w));
                 // Close target goes first so it wins over the tab body.
-                let slot_cx = slot_x + rect.w - TAB_PAD * s / 2.0 - close_w;
+                let slot_cx = slot_x + rect.w - close_w - 4.0 * s;
                 self.tab_hits.push((Rect { x: slot_cx, y: top, w: close_w, h }, TabHit::Close(i)));
             }
             self.tab_hits.push((slot, TabHit::Tab(i)));
@@ -675,17 +794,42 @@ impl State {
         let ids: Vec<u64> = self.tabs.list.iter().map(|t| t.id).collect();
         self.tab_x.retain(|id, _| ids.contains(id));
         let plus_x = first_x + n * tab_w;
-        out.push(Chrome::Text {
-            x: plus_x + ((PLUS_W * s - cw) / 2.0).round(),
-            y: text_y,
-            text: "+".into(),
-            color: theme::MUTED,
-            max_w: cw,
-        });
+        out.push(label(plus_x + 8.0 * s, top + (h - 16.0 * s * 1.3) / 2.0, "+".into(), Face::Sans, 16.0 * s, false, theme::MUTED, PLUS_W * s));
         self.tab_hits.push((Rect { x: plus_x, y: top, w: PLUS_W * s, h }, TabHit::New));
-        let (_, dividers) = self.tab_layout(self.tabs.active);
-        out.extend(dividers.into_iter().map(|rect| Chrome::Rect { rect, color: HAIRLINE }));
         out
+    }
+
+    /// Rounded cards for the active tab's panes, with a header and a focus ring when split.
+    fn panes_chrome(&mut self, out: &mut Vec<Chrome>) {
+        let s = self.scale();
+        let (rects, _) = self.tab_layout(self.tabs.active);
+        let split = rects.len() > 1;
+        let focused = self.focused_id();
+        for (id, r) in rects {
+            if split && id == focused {
+                let g = 1.5 * s;
+                out.push(Chrome::Round { rect: Rect { x: r.x - g, y: r.y - g, w: r.w + 2.0 * g, h: r.h + 2.0 * g }, radius: 12.0 * s + g, color: theme::ACCENT });
+            }
+            out.push(Chrome::Round { rect: r, radius: 12.0 * s, color: theme::BACKGROUND });
+            let px = 12.0 * s;
+            let hy = r.y + (HEADER_H * s - px * 1.3) / 2.0;
+            let close_w = 22.0 * s;
+            let mut x = r.x + 12.0 * s;
+            let max = r.x + r.w - close_w - 8.0 * s;
+            let title = self.pane_label(id);
+            let tw = self.fonts.run(&title, Face::Sans, px, true).width.min(max - x);
+            out.push(label(x, hy, title, Face::Sans, px, true, theme::FOREGROUND, max - x));
+            x += tw + 10.0 * s;
+            if let Some(branch) = self.panes.get(&id).and_then(|p| p.ctx.as_ref()).and_then(|c| c.branch.clone()) {
+                if x + 40.0 * s < max {
+                    out.push(label(x, hy + s, "\u{e0a0}".into(), Face::Mono, 11.0 * s, false, theme::MUTED, 14.0 * s));
+                    out.push(label(x + 14.0 * s, hy + s, branch, Face::Sans, 11.5 * s, false, theme::MUTED, max - x - 14.0 * s));
+                }
+            }
+            let cx = r.x + r.w - close_w - 6.0 * s;
+            out.push(label(cx + 6.0 * s, r.y + (HEADER_H * s - 14.0 * s * 1.3) / 2.0, "×".into(), Face::Sans, 14.0 * s, false, theme::MUTED, close_w));
+            self.ui_hits.push((Rect { x: cx, y: r.y, w: close_w, h: HEADER_H * s }, UiHit::ClosePane(id)));
+        }
     }
 
     fn pane_at(&self, x: f32, y: f32) -> Option<PaneId> {
@@ -961,6 +1105,8 @@ impl ApplicationHandler<UserEvent> for App {
             sidebar_hits: vec![],
             next_tick: Instant::now(),
             panel: true,
+            panel_changes: false,
+            ui_hits: vec![],
             ctx_tx: {
                 let proxy = self.proxy.clone();
                 context::spawn(move |u| proxy.send_event(UserEvent::Context(u)).is_ok(), session::cwd_of)
@@ -1164,6 +1310,26 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::MouseInput { state, button, .. } => {
                 let pressed = state == ElementState::Pressed;
                 let (x, y) = (st.mouse.x as f32, st.mouse.y as f32);
+                if pressed && button == MouseButton::Left {
+                    let hit = st.ui_hits.iter().find(|(r, _)| r.contains(x, y)).map(|(_, h)| match h {
+                        UiHit::PanelTab(c) => UiHit::PanelTab(*c),
+                        UiHit::ClosePane(id) => UiHit::ClosePane(*id),
+                    });
+                    match hit {
+                        Some(UiHit::PanelTab(c)) => {
+                            st.panel_changes = c;
+                            st.window.request_redraw();
+                            return;
+                        }
+                        Some(UiHit::ClosePane(id)) => {
+                            if st.close_pane(id) {
+                                event_loop.exit();
+                            }
+                            return;
+                        }
+                        None => {}
+                    }
+                }
                 if pressed && button == MouseButton::Left && x < st.sidebar_w() {
                     if let Some(id) = st.sidebar_hits.iter().find(|(r, _)| r.contains(x, y)).map(|(_, id)| *id) {
                         st.jump_to(id);
@@ -1290,7 +1456,7 @@ impl ApplicationHandler<UserEvent> for App {
                     })
                     .collect();
                 let refs: Vec<(&Frame, (f32, f32))> = frames.iter().map(|(f, o)| (f, *o)).collect();
-                if st.renderer.render(&refs, &chrome, &mut st.fonts) || st.animating {
+                if st.renderer.render(&refs, &chrome, &mut st.fonts, GUTTER) || st.animating {
                     st.window.request_redraw();
                 }
             }
@@ -1321,6 +1487,16 @@ impl ApplicationHandler<UserEvent> for App {
         }
         event_loop.set_control_flow(ControlFlow::WaitUntil(st.next_blink.min(st.next_tick)));
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn label(x: f32, y: f32, text: String, face: Face, px: f32, bold: bool, color: Rgb, max_w: f32) -> Chrome {
+    Chrome::Label { x, y, text, face, px, bold, color, max_w }
+}
+
+/// `color` at `alpha` over `base`, as an opaque colour.
+fn mix(color: Rgb, base: Rgb, alpha: f32) -> Rgb {
+    [0, 1, 2].map(|i| (color[i] as f32 * alpha + base[i] as f32 * (1.0 - alpha)).round() as u8)
 }
 
 fn folder_name(cwd: Option<PathBuf>) -> String {

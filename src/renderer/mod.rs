@@ -9,9 +9,9 @@ use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::vte::ansi::{CursorShape, NamedColor};
 use winit::window::Window;
 
-use crate::font::Fonts;
+use crate::font::{Face, Fonts};
 use crate::theme::{self, Rgb};
-use atlas::{Atlas, Entry, GlyphKey};
+use atlas::{Atlas, AtlasKey, Entry, GlyphKey};
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -30,6 +30,7 @@ unsafe impl bytemuck::Pod for Quad {}
 const SOLID: u32 = 0;
 const MASK: u32 = 1;
 const COLOR: u32 = 2;
+const ROUND: u32 = 3;
 
 pub struct CellDraw {
     pub col: usize,
@@ -121,10 +122,12 @@ fn solid(x: f32, y: f32, w: f32, h: f32, c: Rgb) -> Quad {
     Quad { pos: [x, y], size: [w, h], uv: [0.0; 4], color: rgba(c), kind: SOLID, _pad: [0; 3] }
 }
 
-/// Window decoration drawn behind the panes: tab bar, dividers.
+/// Window decoration drawn behind the panes: tab bar, sidebar, panel, pane cards.
 pub enum Chrome {
     Rect { rect: crate::layout::Rect, color: Rgb },
-    Text { x: f32, y: f32, text: String, color: Rgb, max_w: f32 },
+    Round { rect: crate::layout::Rect, radius: f32, color: Rgb },
+    /// One line of interface text; `y` is the top of the line box (px × 1.3 tall).
+    Label { x: f32, y: f32, text: String, face: Face, px: f32, bold: bool, color: Rgb, max_w: f32 },
 }
 
 fn rgba(c: Rgb) -> [f32; 4] {
@@ -299,11 +302,15 @@ impl Renderer {
         self.atlas.clear();
     }
 
-    fn glyph(&mut self, fonts: &mut Fonts, key: GlyphKey) -> Option<Entry> {
+    fn glyph(&mut self, fonts: &mut Fonts, key: AtlasKey) -> Option<Entry> {
         if let Some(entry) = self.atlas.map.get(&key) {
             return *entry;
         }
-        let entry = fonts.rasterize(key.c, key.bold, key.italic).and_then(|g| {
+        let image = match key {
+            AtlasKey::Cell(k) => fonts.rasterize(k.c, k.bold, k.italic),
+            AtlasKey::Run(k) => fonts.raster_key(k),
+        };
+        let entry = image.and_then(|g| {
             let (x, y) = self.atlas.alloc(g.width, g.height).or_else(|| {
                 self.atlas.clear();
                 self.atlas_reset = true;
@@ -350,11 +357,11 @@ impl Renderer {
                 _ => {}
             }
             if !matches!(cell.c, ' ' | '\t' | '▀' | '▄' | '█') {
-                let key = GlyphKey {
+                let key = AtlasKey::Cell(GlyphKey {
                     c: cell.c,
                     bold: cell.flags.contains(Flags::BOLD),
                     italic: cell.flags.contains(Flags::ITALIC),
-                };
+                });
                 if let Some(e) = self.glyph(fonts, key) {
                     self.quads.push(Quad {
                         pos: [x + e.left as f32, y + fonts.baseline - e.top as f32],
@@ -391,22 +398,26 @@ impl Renderer {
 
     }
 
-    /// Queue a text run starting at (x, y = cell top), truncated with `…` past `max_w`.
-    fn push_text(&mut self, fonts: &mut Fonts, x: f32, y: f32, text: &str, color: Rgb, max_w: f32) {
-        let fit = (max_w / fonts.cell_w).floor().max(0.0) as usize;
-        let count = text.chars().count();
-        let chars: Vec<char> = if count > fit {
-            text.chars().take(fit.saturating_sub(1)).chain(std::iter::once('…')).collect()
-        } else {
-            text.chars().collect()
-        };
-        for (i, c) in chars.into_iter().enumerate() {
-            if c == ' ' {
-                continue;
+    /// Queue one line of interface text, cut with `…` when wider than `max_w`.
+    #[allow(clippy::too_many_arguments)]
+    fn push_label(&mut self, fonts: &mut Fonts, x: f32, y: f32, text: &str, face: Face, px: f32, bold: bool, color: Rgb, max_w: f32) {
+        let mut run = fonts.run(text, face, px, bold);
+        if run.width > max_w {
+            // Binary search the longest prefix that fits with an ellipsis.
+            let chars: Vec<char> = text.chars().collect();
+            let (mut lo, mut hi) = (0, chars.len());
+            while lo < hi {
+                let mid = (lo + hi).div_ceil(2);
+                let t: String = chars[..mid].iter().collect::<String>().trim_end().to_string() + "…";
+                if fonts.run(&t, face, px, bold).width <= max_w { lo = mid } else { hi = mid - 1 }
             }
-            if let Some(e) = self.glyph(fonts, GlyphKey { c, bold: false, italic: false }) {
+            let t: String = chars[..lo].iter().collect::<String>().trim_end().to_string() + "…";
+            run = fonts.run(&t, face, px, bold);
+        }
+        for (key, gx, gy) in run.glyphs {
+            if let Some(e) = self.glyph(fonts, AtlasKey::Run(key)) {
                 self.quads.push(Quad {
-                    pos: [x + i as f32 * fonts.cell_w + e.left as f32, y + fonts.baseline - e.top as f32],
+                    pos: [(x + gx as f32 + e.left as f32).round(), (y + gy as f32 - e.top as f32).round()],
                     size: [e.w as f32, e.h as f32],
                     uv: [e.x as f32, e.y as f32, e.w as f32, e.h as f32],
                     color: rgba(color),
@@ -419,13 +430,23 @@ impl Renderer {
 
     /// Draw chrome (behind) and every pane frame. Returns true when another frame
     /// is needed (the atlas was reset mid-frame).
-    pub fn render(&mut self, frames: &[(&Frame, (f32, f32))], chrome: &[Chrome], fonts: &mut Fonts) -> bool {
+    pub fn render(&mut self, frames: &[(&Frame, (f32, f32))], chrome: &[Chrome], fonts: &mut Fonts, clear: Rgb) -> bool {
         self.atlas_reset = false;
         self.quads.clear();
         for item in chrome {
             match item {
                 Chrome::Rect { rect, color } => self.quads.push(solid(rect.x, rect.y, rect.w, rect.h, *color)),
-                Chrome::Text { x, y, text, color, max_w } => self.push_text(fonts, *x, *y, text, *color, *max_w),
+                Chrome::Round { rect, radius, color } => self.quads.push(Quad {
+                    pos: [rect.x, rect.y],
+                    size: [rect.w, rect.h],
+                    uv: [radius.min(rect.w / 2.0).min(rect.h / 2.0), 0.0, 0.0, 0.0],
+                    color: rgba(*color),
+                    kind: ROUND,
+                    _pad: [0; 3],
+                }),
+                Chrome::Label { x, y, text, face, px, bold, color, max_w } => {
+                    self.push_label(fonts, *x, *y, text, *face, *px, *bold, *color, *max_w)
+                }
             }
         }
         for (frame, pad) in frames {
@@ -449,7 +470,7 @@ impl Renderer {
         let view = output.texture.create_view(&Default::default());
         let mut encoder = self.device.create_command_encoder(&Default::default());
         {
-            let [r, g, b] = theme::BACKGROUND.map(|v| v as f64 / 255.0);
+            let [r, g, b] = clear.map(|v| v as f64 / 255.0);
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {

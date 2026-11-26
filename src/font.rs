@@ -1,5 +1,7 @@
 //! Font lookup, cell metrics and glyph rasterisation (cosmic-text + swash).
-use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, Style, SwashCache, SwashContent, Weight};
+use std::collections::HashMap;
+
+use cosmic_text::{Attrs, Buffer, CacheKey, Family, FontSystem, Metrics, Shaping, Style, SwashCache, SwashContent, Weight};
 
 pub const FALLBACK_FAMILY: &str = "Menlo";
 
@@ -13,10 +15,29 @@ pub struct Glyph {
     pub rgba: Vec<u8>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Face {
+    /// The system UI font (SF Pro).
+    Sans,
+    /// The configured terminal font.
+    Mono,
+}
+
+/// A shaped single-line text run: glyph cache keys with positions relative to the
+/// run's top-left (y already includes the baseline), and its width in pixels.
+#[derive(Clone)]
+pub struct Run {
+    pub glyphs: Vec<(CacheKey, i32, i32)>,
+    pub width: f32,
+}
+
 pub struct Fonts {
     system: FontSystem,
     cache: SwashCache,
     buffer: Buffer,
+    ui_buffer: Buffer,
+    runs: HashMap<(String, Face, u32, bool), Run>,
+    sans: String,
     pub family: String,
     /// Font size in physical pixels.
     pub px: f32,
@@ -37,10 +58,19 @@ impl Fonts {
             FALLBACK_FAMILY.to_string()
         };
         let buffer = Buffer::new(&mut system, Metrics::new(14.0, 18.0));
+        let ui_buffer = Buffer::new(&mut system, Metrics::new(13.0, 17.0));
+        let sans = ["System Font", ".SF NS", "Helvetica Neue"]
+            .iter()
+            .find(|name| system.db().faces().any(|f| f.families.iter().any(|(n, _)| n == *name)))
+            .unwrap_or(&"Helvetica")
+            .to_string();
         let mut fonts = Self {
             system,
             cache: SwashCache::new(),
             buffer,
+            ui_buffer,
+            runs: HashMap::new(),
+            sans,
             family,
             px: 0.0,
             cell_w: 0.0,
@@ -83,6 +113,39 @@ impl Fonts {
             let run = self.buffer.layout_runs().next()?;
             run.glyphs.first()?.physical((0.0, 0.0), 1.0).cache_key
         };
+        self.raster_key(key)
+    }
+
+    /// Shape one line of interface text (cached).
+    pub fn run(&mut self, text: &str, face: Face, px: f32, bold: bool) -> Run {
+        let key = (text.to_string(), face, px.to_bits(), bold);
+        if let Some(run) = self.runs.get(&key) {
+            return run.clone();
+        }
+        if self.runs.len() > 4096 {
+            self.runs.clear();
+        }
+        let family = match face {
+            Face::Sans => Family::Name(&self.sans),
+            Face::Mono => Family::Name(&self.family),
+        };
+        let attrs = Attrs::new().family(family).weight(if bold { Weight::SEMIBOLD } else { Weight::NORMAL });
+        self.ui_buffer.set_metrics(Metrics::new(px, (px * 1.3).ceil()));
+        self.ui_buffer.set_text(text, &attrs, Shaping::Advanced, None);
+        self.ui_buffer.shape_until_scroll(&mut self.system, false);
+        let mut run = Run { glyphs: vec![], width: 0.0 };
+        if let Some(line) = self.ui_buffer.layout_runs().next() {
+            run.width = line.line_w;
+            for g in line.glyphs {
+                let p = g.physical((0.0, line.line_y), 1.0);
+                run.glyphs.push((p.cache_key, p.x, p.y));
+            }
+        }
+        self.runs.insert(key, run.clone());
+        run
+    }
+
+    pub fn raster_key(&mut self, key: CacheKey) -> Option<Glyph> {
         let image = self.cache.get_image_uncached(&mut self.system, key)?;
         if image.placement.width == 0 || image.placement.height == 0 {
             return None;

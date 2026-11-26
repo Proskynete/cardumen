@@ -12,7 +12,7 @@ For a pane inside a git repository, the system SHALL compute the step in this pi
 - **THEN** the step is "Review" and the PR shows as "#42 abierto"
 
 ### Requirement: Branch and changes
-The system SHALL show the current branch (detached HEAD as the short commit) and the changes against the merge base with the remote default branch, including uncommitted work: number of files, lines added and removed, and up to 8 files with their own counts, plus the number of commits not pushed.
+The system SHALL show the current branch (detached HEAD as the short commit) and the changes against the merge base with the remote default branch, including uncommitted work: number of files, lines added and removed, and up to 30 files with their own counts, plus the number of commits not pushed.
 
 #### Scenario: Work in progress
 - **WHEN** a branch changed 3 files (+120 −8) and has 2 unpushed commits

@@ -10,6 +10,13 @@ pub struct GlyphKey {
     pub italic: bool,
 }
 
+/// Terminal cells are keyed by char; interface text by the shaped glyph's cache key.
+#[derive(Clone, Copy, Hash, PartialEq, Eq)]
+pub enum AtlasKey {
+    Cell(GlyphKey),
+    Run(cosmic_text::CacheKey),
+}
+
 #[derive(Clone, Copy)]
 pub struct Entry {
     pub x: u32,
@@ -27,7 +34,7 @@ pub struct Atlas {
     y: u32,
     row_h: u32,
     /// `None` caches "this char has no visible glyph" (space, etc.).
-    pub map: HashMap<GlyphKey, Option<Entry>>,
+    pub map: HashMap<AtlasKey, Option<Entry>>,
 }
 
 impl Atlas {
