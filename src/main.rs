@@ -1,5 +1,6 @@
 mod config;
 mod context;
+mod diff;
 mod font;
 mod input;
 mod layout;
@@ -63,6 +64,12 @@ const CARD: Rgb = [0x0F, 0x1E, 0x25];
 const BODY: Rgb = [0xC9, 0xD6, 0xD8];
 const WARM: Rgb = [0xF2, 0xA6, 0x5A];
 const SUCCESS: Rgb = [0x4F, 0xB4, 0x77];
+/// Diff viewer: header, file list width and rows, file header, diff rows.
+const DIFF_HEAD_H: f32 = 40.0;
+const DIFF_LIST_W: f32 = 240.0;
+const DIFF_LIST_ROW_H: f32 = 42.0;
+const DIFF_FILE_H: f32 = 32.0;
+const DIFF_ROW_H: f32 = 18.0;
 
 const BLINK: Duration = Duration::from_millis(530);
 const MULTI_CLICK: Duration = Duration::from_millis(400);
@@ -87,6 +94,24 @@ enum UiHit {
     Range(usage::Range),
     CloseUsage,
     OpenUsage,
+    /// A file of the focused pane's Cambios list.
+    DiffFile(usize),
+    /// A file in the diff viewer's list.
+    DiffRow(usize),
+    CloseDiff,
+}
+
+/// Full diff over the pane area.
+struct DiffView {
+    repo: PathBuf,
+    data: Option<Box<diff::Diff>>,
+    loading: bool,
+    file: usize,
+    /// Pixel offsets of the diff rows and of the file list.
+    scroll: f32,
+    list_scroll: f32,
+    /// File to select when the data arrives.
+    want: Option<String>,
 }
 
 enum TabHit {
@@ -137,6 +162,7 @@ struct State {
     usage_loading: bool,
     footer_hover: bool,
     ui_hits: Vec<(Rect, UiHit)>,
+    diff: Option<DiffView>,
     ctx_tx: std::sync::mpsc::Sender<context::Request>,
     /// Last seen structure (without directories) and when to save it.
     saved_shape: Option<session_file::Saved>,
@@ -707,10 +733,11 @@ impl State {
             y += 22.0 * s;
         }
         let mpx = 11.5 * s;
-        for f in c.files.iter().take(limit) {
+        for (i, f) in c.files.iter().take(limit).enumerate() {
             if y > height {
                 break;
             }
+            self.ui_hits.push((Rect { x: left, y, w: tw, h: 20.0 * s }, UiHit::DiffFile(i)));
             out.push(label(left, y, format!("+{}", f.added), Face::Mono, mpx, false, SUCCESS, 44.0 * s));
             out.push(label(left + 44.0 * s, y, format!("−{}", f.removed), Face::Mono, mpx, false, ERROR, 40.0 * s));
             // Keep the end of long paths: the file name matters most.
@@ -945,6 +972,301 @@ impl State {
         }
     }
 
+    fn toggle_diff(&mut self) {
+        if self.diff.take().is_some() {
+            self.window.request_redraw();
+        } else {
+            self.open_diff(None);
+        }
+    }
+
+    /// Open the diff of the focused pane's repo at `want` (else the first file); no-op outside git.
+    fn open_diff(&mut self, want: Option<String>) {
+        let Some(repo) = self.focused().ctx.as_ref().map(|c| c.repo.clone()) else { return };
+        match self.diff.as_mut() {
+            Some(v) if v.repo == repo && v.data.is_some() => {
+                let i = want.and_then(|w| v.data.as_ref()?.files.iter().position(|f| f.path == w));
+                if let Some(i) = i {
+                    self.diff_select(i);
+                }
+            }
+            _ => self.diff = Some(DiffView { repo, data: None, loading: false, file: 0, scroll: 0.0, list_scroll: 0.0, want }),
+        }
+        self.load_diff();
+    }
+
+    /// Recompute the diff off the UI thread, keeping the selected file.
+    fn load_diff(&mut self) {
+        let Some(v) = self.diff.as_mut() else { return };
+        v.loading = true;
+        if v.want.is_none() {
+            v.want = v.data.as_ref().and_then(|d| d.files.get(v.file)).map(|f| f.path.clone());
+        }
+        let (repo, proxy) = (v.repo.clone(), self.proxy.clone());
+        let _ = std::thread::Builder::new().name("diff".into()).spawn(move || {
+            let d = diff::load(&repo);
+            let _ = proxy.send_event(UserEvent::Diff(repo, Box::new(d)));
+        });
+        self.window.request_redraw();
+    }
+
+    fn diff_loaded(&mut self, repo: PathBuf, d: Box<diff::Diff>) {
+        let Some(v) = self.diff.as_mut().filter(|v| v.repo == repo) else { return };
+        let shown = v.data.as_ref().and_then(|d| d.files.get(v.file)).map(|f| f.path.clone());
+        let i = v.want.take().and_then(|w| d.files.iter().position(|f| f.path == w)).unwrap_or(0);
+        let same = shown.as_deref() == d.files.get(i).map(|f| f.path.as_str());
+        v.data = Some(d);
+        v.loading = false;
+        if same {
+            v.file = i;
+        } else {
+            self.diff_select(i);
+        }
+        self.window.request_redraw();
+    }
+
+    /// Viewer areas: the file list and the diff rows (under the file header).
+    fn diff_geom(&self) -> (Rect, Rect) {
+        let s = self.scale();
+        let r = self.content_rect();
+        let top = r.y + DIFF_HEAD_H * s;
+        let list_w = DIFF_LIST_W * s;
+        let list = Rect { x: r.x, y: top + 6.0 * s, w: list_w, h: r.y + r.h - top - 12.0 * s };
+        let body_y = top + DIFF_FILE_H * s;
+        let body = Rect { x: r.x + list_w + s, y: body_y, w: r.w - list_w - s, h: r.y + r.h - body_y - 8.0 * s };
+        (list, body)
+    }
+
+    fn diff_select(&mut self, i: usize) {
+        let s = self.scale();
+        let list = self.diff_geom().0;
+        let Some(v) = self.diff.as_mut() else { return };
+        let n = v.data.as_ref().map_or(0, |d| d.files.len());
+        if n == 0 {
+            return;
+        }
+        v.file = i.min(n - 1);
+        v.scroll = 0.0;
+        v.list_scroll = diff::reveal(v.list_scroll, v.file, DIFF_LIST_ROW_H * s, list.h);
+        self.window.request_redraw();
+    }
+
+    /// Scroll the diff rows, or the file list, by `dy` pixels.
+    fn diff_scroll(&mut self, dy: f32, list: bool) {
+        let s = self.scale();
+        let (lr, body) = self.diff_geom();
+        let Some(v) = self.diff.as_mut() else { return };
+        let Some(d) = v.data.as_deref() else { return };
+        if list {
+            v.list_scroll = diff::clamp(v.list_scroll + dy, d.files.len(), DIFF_LIST_ROW_H * s, lr.h);
+        } else {
+            let rows = d.files.get(v.file).map_or(0, diff::rows);
+            v.scroll = diff::clamp(v.scroll + dy, rows, DIFF_ROW_H * s, body.h);
+        }
+        self.window.request_redraw();
+    }
+
+    /// Keys while the viewer is open (no Cmd).
+    fn diff_key(&mut self, key: &Key) {
+        let row = DIFF_ROW_H * self.scale();
+        let page = (self.diff_geom().1.h / row).floor().max(1.0) * row;
+        let file = self.diff.as_ref().map_or(0, |v| v.file);
+        match key {
+            Key::Named(NamedKey::Escape) => self.toggle_diff(),
+            Key::Named(NamedKey::ArrowDown) => self.diff_scroll(row, false),
+            Key::Named(NamedKey::ArrowUp) => self.diff_scroll(-row, false),
+            Key::Named(NamedKey::Space) => self.diff_scroll(if self.mods.shift_key() { -page } else { page }, false),
+            Key::Named(NamedKey::PageDown) => self.diff_scroll(page, false),
+            Key::Named(NamedKey::PageUp) => self.diff_scroll(-page, false),
+            Key::Named(NamedKey::Home) => self.diff_scroll(f32::MIN, false),
+            Key::Named(NamedKey::End) => self.diff_scroll(f32::MAX, false),
+            Key::Character(c) => match c.as_str() {
+                "j" => self.diff_scroll(row, false),
+                "k" => self.diff_scroll(-row, false),
+                "n" => self.diff_select(file + 1),
+                "p" => self.diff_select(file.saturating_sub(1)),
+                "r" => self.load_diff(),
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+
+    /// The diff viewer, drawn instead of the pane cards.
+    fn diff_chrome(&mut self, out: &mut Vec<Chrome>) {
+        let s = self.scale();
+        let r = self.content_rect();
+        let (list, body) = self.diff_geom();
+        out.push(Chrome::Round { rect: r, radius: 12.0 * s, color: theme::BACKGROUND });
+        // Taken out while drawing so `self` stays free for measuring text.
+        let Some(v) = self.diff.take() else { return };
+
+        // Header: title, totals, notices, esc.
+        let hy = r.y + (DIFF_HEAD_H * s - 13.0 * s * 1.3) / 2.0;
+        let mut x = r.x + 16.0 * s;
+        let tw = self.fonts.run("Diff", Face::Sans, 13.0 * s, true).width;
+        out.push(label(x, hy, "Diff".into(), Face::Sans, 13.0 * s, true, theme::FOREGROUND, tw + s));
+        x += tw + 12.0 * s;
+        if let Some(d) = v.data.as_deref() {
+            let (a, rm) = d.files.iter().fold((0, 0), |(a, rm), f| (a + f.added, rm + f.removed));
+            let unit = if d.files.len() == 1 { "archivo" } else { "archivos" };
+            for (t, color) in [(format!("{} {unit}", d.files.len()), theme::MUTED), (format!("+{a}"), SUCCESS), (format!("−{rm}"), ERROR)] {
+                let w = self.fonts.run(&t, Face::Sans, 12.5 * s, false).width;
+                out.push(label(x, hy + s, t, Face::Sans, 12.5 * s, false, color, w + s));
+                x += w + 8.0 * s;
+            }
+            if d.truncated {
+                x += self.pill(out, x + 4.0 * s, hy, "diff truncado", WARM, theme::BACKGROUND) + 8.0 * s;
+            }
+        }
+        if v.loading && v.data.is_some() {
+            out.push(label(x + 4.0 * s, hy + s, "actualizando…".into(), Face::Sans, 11.5 * s, false, theme::MUTED, 120.0 * s));
+        }
+        let esc_w = self.fonts.run("esc", Face::Sans, 11.0 * s, false).width + 16.0 * s;
+        let esc = Rect { x: r.x + r.w - 14.0 * s - esc_w, y: r.y + (DIFF_HEAD_H * s - 20.0 * s) / 2.0, w: esc_w, h: 20.0 * s };
+        out.push(Chrome::Round { rect: esc, radius: 6.0 * s, color: CARD });
+        out.push(label(esc.x + 8.0 * s, esc.y + (esc.h - 11.0 * s * 1.3) / 2.0, "esc".into(), Face::Sans, 11.0 * s, false, theme::MUTED, esc_w));
+        self.ui_hits.push((esc, UiHit::CloseDiff));
+        let hint = "j k  línea · n p  archivo · r  actualizar";
+        let hw = self.fonts.run(hint, Face::Sans, 11.0 * s, false).width;
+        if esc.x - hw - 14.0 * s > x + 100.0 * s {
+            out.push(label(esc.x - hw - 14.0 * s, hy + 1.5 * s, hint.into(), Face::Sans, 11.0 * s, false, theme::MUTED, hw + s));
+        }
+        let head_bottom = r.y + DIFF_HEAD_H * s;
+        out.push(Chrome::Rect { rect: Rect { x: r.x, y: head_bottom, w: r.w, h: s }, color: HAIRLINE });
+
+        let message = |out: &mut Vec<Chrome>, t: String, color: Rgb| {
+            out.push(label(r.x + 18.0 * s, head_bottom + 16.0 * s, t, Face::Sans, 12.5 * s, false, color, r.w - 36.0 * s));
+        };
+        let d = match v.data.as_deref() {
+            None => {
+                message(out, "Calculando diff…".into(), theme::MUTED);
+                self.diff = Some(v);
+                return;
+            }
+            Some(d) if d.error.is_some() => {
+                message(out, d.error.clone().unwrap_or_default(), ERROR);
+                self.diff = Some(v);
+                return;
+            }
+            Some(d) if d.files.is_empty() => {
+                message(out, "Sin cambios".into(), theme::MUTED);
+                self.diff = Some(v);
+                return;
+            }
+            Some(d) => d,
+        };
+        out.push(Chrome::Rect { rect: Rect { x: list.x + list.w, y: head_bottom, w: s, h: r.y + r.h - head_bottom }, color: HAIRLINE });
+
+        // File list.
+        let row_h = DIFF_LIST_ROW_H * s;
+        let range = diff::visible(v.list_scroll, d.files.len(), row_h, list.h);
+        let first = range.start;
+        for i in range {
+            let f = &d.files[i];
+            let row = Rect { x: list.x + 6.0 * s, y: list.y + (i - first) as f32 * row_h, w: list.w - 12.0 * s, h: row_h - 2.0 * s };
+            let on = i == v.file;
+            if on {
+                out.push(Chrome::Round { rect: row, radius: 8.0 * s, color: SELECTED });
+            }
+            let (dir, name) = f.path.rsplit_once('/').unwrap_or(("", &f.path));
+            let inner = row.w - 20.0 * s;
+            out.push(label(row.x + 10.0 * s, row.y + 4.0 * s, name.into(), Face::Sans, 12.5 * s, on, theme::FOREGROUND, inner));
+            let counts = if f.binary { vec![("bin".to_string(), theme::MUTED)] } else { vec![(format!("+{}", f.added), SUCCESS), (format!("−{}", f.removed), ERROR)] };
+            let mut cx = row.x + row.w - 10.0 * s;
+            for (t, color) in counts.into_iter().rev() {
+                let w = self.fonts.run(&t, Face::Mono, 11.0 * s, false).width;
+                cx -= w;
+                out.push(label(cx, row.y + 22.0 * s, t, Face::Mono, 11.0 * s, false, color, w + s));
+                cx -= 6.0 * s;
+            }
+            let status = match f.status {
+                diff::Status::Added => "nuevo",
+                diff::Status::Deleted => "eliminado",
+                diff::Status::Renamed => "renombrado",
+                diff::Status::Modified => "",
+            };
+            let sub = [status, dir].iter().filter(|t| !t.is_empty()).copied().collect::<Vec<_>>().join(" · ");
+            out.push(label(row.x + 10.0 * s, row.y + 22.0 * s, sub, Face::Sans, 11.0 * s, false, theme::MUTED, cx - row.x - 14.0 * s));
+            self.ui_hits.push((row, UiHit::DiffRow(i)));
+        }
+
+        // Selected file: header, then its rows.
+        let f = &d.files[v.file.min(d.files.len() - 1)];
+        let fy = head_bottom + (DIFF_FILE_H * s - 12.5 * s * 1.3) / 2.0;
+        let note = match (&f.from, f.status) {
+            (Some(from), _) => format!("renombrado desde {from}"),
+            (_, diff::Status::Added) => "archivo nuevo".into(),
+            (_, diff::Status::Deleted) => "eliminado".into(),
+            _ => String::new(),
+        };
+        let pw = self.fonts.run(&f.path, Face::Mono, 12.0 * s, true).width.min(body.w * 0.6);
+        out.push(label(body.x + 16.0 * s, fy, f.path.clone(), Face::Mono, 12.0 * s, true, theme::FOREGROUND, pw));
+        out.push(label(body.x + 28.0 * s + pw, fy + s, note, Face::Sans, 11.5 * s, false, theme::MUTED, body.w - pw - 44.0 * s));
+        out.push(Chrome::Rect { rect: Rect { x: body.x, y: body.y - s, w: body.w, h: s }, color: HAIRLINE });
+
+        let px = 12.0 * s;
+        let rh = DIFF_ROW_H * s;
+        let cw = self.fonts.run("0", Face::Mono, px, false).width.max(1.0);
+        let digits = f.lines.iter().filter_map(|l| l.old.max(l.new)).max().unwrap_or(0).to_string().len().max(3);
+        let old_x = body.x + 8.0 * s;
+        let new_x = old_x + (digits + 1) as f32 * cw;
+        let gutter_end = new_x + digits as f32 * cw + 8.0 * s;
+        let sign_x = gutter_end + 6.0 * s;
+        let text_x = sign_x + 2.0 * cw;
+        let text_w = body.x + body.w - text_x - 12.0 * s;
+        let max_chars = (text_w / cw) as usize + 1;
+        let ty = (rh - px * 1.3) / 2.0;
+        let rows = diff::rows(f);
+        let range = diff::visible(v.scroll, rows, rh, body.h);
+        let first = range.start;
+        for i in range {
+            let y = body.y + (i - first) as f32 * rh;
+            let Some(l) = f.lines.get(i) else {
+                // Past the lines: the truncation notice, or why there are none.
+                let (t, color) = if f.truncated && (i > 0 || !f.lines.is_empty()) {
+                    ("diff truncado", WARM)
+                } else if f.binary {
+                    ("Archivo binario", theme::MUTED)
+                } else if f.status == diff::Status::Renamed {
+                    ("Renombrado sin cambios de contenido", theme::MUTED)
+                } else {
+                    ("Sin cambios de contenido", theme::MUTED)
+                };
+                out.push(label(old_x, y + ty, t.into(), Face::Sans, 12.0 * s, false, color, body.w - 24.0 * s));
+                continue;
+            };
+            let full = Rect { x: body.x, y, w: body.w, h: rh };
+            let num = |n: Option<u32>| n.map_or(String::new(), |n| format!("{n:>digits$}"));
+            let (sign, tint) = match l.kind {
+                diff::Kind::Hunk => {
+                    out.push(Chrome::Rect { rect: full, color: mix(theme::ACCENT, theme::BACKGROUND, 0.07) });
+                    out.push(label(old_x, y + ty, l.text.clone(), Face::Mono, px, false, theme::MUTED, body.w - 20.0 * s));
+                    continue;
+                }
+                diff::Kind::NoNewline => {
+                    out.push(label(text_x, y + ty, "sin salto de línea al final".into(), Face::Sans, 11.5 * s, false, theme::MUTED, text_w));
+                    continue;
+                }
+                diff::Kind::Add => ("+", Some(SUCCESS)),
+                diff::Kind::Del => ("−", Some(ERROR)),
+                diff::Kind::Ctx => ("", None),
+            };
+            if let Some(c) = tint {
+                out.push(Chrome::Rect { rect: full, color: mix(c, theme::BACKGROUND, 0.12) });
+                out.push(Chrome::Rect { rect: Rect { w: gutter_end - body.x, ..full }, color: mix(c, theme::BACKGROUND, 0.2) });
+                out.push(label(sign_x, y + ty, sign.into(), Face::Mono, px, false, c, 2.0 * cw));
+            }
+            out.push(label(old_x, y + ty, num(l.old), Face::Mono, px, false, theme::MUTED, digits as f32 * cw + s));
+            out.push(label(new_x, y + ty, num(l.new), Face::Mono, px, false, theme::MUTED, digits as f32 * cw + s));
+            let text: String = l.text.replace('\t', "    ").chars().take(max_chars).collect();
+            if !text.trim().is_empty() {
+                out.push(label(text_x, y + ty, text, Face::Mono, px, false, if tint.is_some() { theme::FOREGROUND } else { BODY }, text_w));
+            }
+        }
+        self.diff = Some(v);
+    }
+
     /// Activate the tab holding `id` and focus it.
     fn jump_to(&mut self, id: PaneId) {
         if let Some(i) = self.tabs.list.iter().position(|t| t.root.contains(id)) {
@@ -970,7 +1292,11 @@ impl State {
         self.ui_hits.clear();
         self.sidebar_chrome(&mut out);
         self.panel_chrome(&mut out);
-        self.panes_chrome(&mut out);
+        if self.diff.is_some() {
+            self.diff_chrome(&mut out);
+        } else {
+            self.panes_chrome(&mut out);
+        }
 
         self.tab_hits.clear();
         let n = self.tabs.list.len() as f32;
@@ -1271,6 +1597,7 @@ impl State {
                 self.relayout();
             }
             "u" => self.toggle_usage(),
+            "g" => self.toggle_diff(),
             "=" | "+" => self.set_font_size(self.font_points + 1.0),
             "-" => self.set_font_size(self.font_points - 1.0),
             "0" => self.set_font_size(self.config.font.size),
@@ -1416,6 +1743,7 @@ impl ApplicationHandler<UserEvent> for App {
             usage_loading: false,
             footer_hover: false,
             ui_hits: vec![],
+            diff: None,
             ctx_tx: {
                 let proxy = self.proxy.clone();
                 context::spawn(move |u| proxy.send_event(UserEvent::Context(u)).is_ok(), session::cwd_of)
@@ -1443,6 +1771,10 @@ impl ApplicationHandler<UserEvent> for App {
                     st.usage_loading = false;
                     st.window.request_redraw();
                 }
+                return;
+            }
+            UserEvent::Diff(repo, d) => {
+                st.diff_loaded(repo, d);
                 return;
             }
             UserEvent::Context(update) => {
@@ -1582,6 +1914,18 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     return;
                 }
+                if st.diff.is_some() {
+                    let plain = event.key_without_modifiers();
+                    if st.mods.super_key() {
+                        // Cmd shortcuts still work, except pasting into a hidden shell.
+                        if !matches!(&plain, Key::Character(c) if c.as_str() == "v") {
+                            st.shortcut(&event.logical_key, &plain, event.physical_key, event_loop);
+                        }
+                    } else {
+                        st.diff_key(&event.logical_key);
+                    }
+                    return;
+                }
                 let plain = event.key_without_modifiers();
                 if st.shortcut(&event.logical_key, &plain, event.physical_key, event_loop) {
                     return;
@@ -1663,6 +2007,21 @@ impl ApplicationHandler<UserEvent> for App {
                             st.toggle_usage();
                             return;
                         }
+                        Some(UiHit::DiffFile(i)) => {
+                            let path = st.focused().ctx.as_ref().and_then(|c| c.changes.as_ref()?.files.get(i)).map(|f| f.path.clone());
+                            if path.is_some() {
+                                st.open_diff(path);
+                            }
+                            return;
+                        }
+                        Some(UiHit::DiffRow(i)) => {
+                            st.diff_select(i);
+                            return;
+                        }
+                        Some(UiHit::CloseDiff) => {
+                            st.toggle_diff();
+                            return;
+                        }
                         Some(UiHit::PanelTab(c)) => {
                             st.panel_changes = c;
                             st.window.request_redraw();
@@ -1677,7 +2036,7 @@ impl ApplicationHandler<UserEvent> for App {
                         None => {}
                     }
                 }
-                if st.usage_open {
+                if st.usage_open || (pressed && st.diff.is_some() && st.content_rect().contains(x, y)) {
                     return;
                 }
                 if pressed && button == MouseButton::Left && x < st.sidebar_w() {
@@ -1778,6 +2137,14 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::MouseWheel { .. } if st.usage_open => {}
+            WindowEvent::MouseWheel { delta, .. } if st.diff.is_some() && st.content_rect().contains(st.mouse.x as f32, st.mouse.y as f32) => {
+                let dy = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => -y * 3.0 * DIFF_ROW_H * st.scale(),
+                    MouseScrollDelta::PixelDelta(p) => -p.y as f32,
+                };
+                let list = st.diff_geom().0;
+                st.diff_scroll(dy, (st.mouse.x as f32) < list.x + list.w);
+            }
             WindowEvent::MouseWheel { delta, .. } => {
                 let lines = match delta {
                     MouseScrollDelta::LineDelta(_, y) => (y * 3.0) as i32,
@@ -1805,6 +2172,7 @@ impl ApplicationHandler<UserEvent> for App {
                 let (rects, _) = st.tab_layout(st.tabs.active);
                 let frames: Vec<(Frame, (f32, f32))> = rects
                     .iter()
+                    .filter(|_| st.diff.is_none())
                     .filter_map(|(id, rect)| {
                         let pane = st.panes.get(id)?;
                         let is_focused = *id == focused;
