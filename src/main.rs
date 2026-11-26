@@ -1860,7 +1860,7 @@ mod tests {
     #[test]
     fn dates_and_mix() {
         assert_eq!(short_date(0), "1 ene");
-        assert_eq!(short_date(20_782), "24 nov"); // 2026-11-24
+        assert_eq!(short_date(20_781), "24 nov"); // 2026-11-24
         assert_eq!(mix([255, 0, 0], [0, 0, 0], 0.5), [128, 0, 0]);
     }
 }
