@@ -2,7 +2,7 @@
 
 Mi ADE personal para macOS: una terminal liviana, escrita en Rust, pensada para trabajar con varias sesiones de Claude Code en paralelo y saber en segundos en qué va cada una.
 
-<!-- screenshot: docs/cardumen.png -->
+![Cardumen: pestañas por proyecto, sesiones de Claude Code en el sidebar y el panel Resumen](docs/cardumen.png)
 
 Un cardumen es un grupo de peces que nadan juntos. Así trabajo: 4 o 5 proyectos a la vez, cada uno con su sesión de Claude Code. Cardumen no trae IA propia; es el lugar donde esas sesiones viven.
 
@@ -18,6 +18,8 @@ Usé Warp durante años, pero cada vez pesaba más (cerca de 1 GB de RAM), traí
 - **Retomar una sesión en segundos**: el panel *Resumen* muestra en qué paso va (Spec → Tareas → PR → Review → Merge, leído de OpenSpec y del PR/MR), qué te pidió Claude o su último mensaje, el PR/MR (GitHub con `gh`, GitLab con `glab`) y qué cambió en el código.
 - **Diff completo** de los cambios de la rama, con lista de archivos.
 - **Uso de Claude Code**: tokens, tareas, tiempo de agente, tokens por día, cuándo trabajas y desglose por modelo y proyecto, leído de los transcripts locales.
+
+  ![Panel de uso de Claude Code](docs/uso.png)
 - **Vuelve donde lo dejaste**: al abrirla recupera pestañas, nombres, paneles y carpetas.
 - **Bienvenida con Tiburoncín** y la información de tu Mac.
 
