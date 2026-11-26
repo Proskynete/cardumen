@@ -7,6 +7,7 @@ mod renderer;
 mod session;
 mod status;
 mod theme;
+mod usage;
 mod welcome;
 
 use std::collections::HashMap;
@@ -76,9 +77,12 @@ struct Pane {
     last_message: Option<String>,
 }
 
+#[derive(Clone, Copy)]
 enum UiHit {
     PanelTab(bool),
     ClosePane(PaneId),
+    Range(usage::Range),
+    CloseUsage,
 }
 
 enum TabHit {
@@ -123,6 +127,10 @@ struct State {
     next_tick: Instant,
     panel: bool,
     panel_changes: bool,
+    usage_open: bool,
+    usage_range: usage::Range,
+    usage: Option<Box<usage::Summary>>,
+    usage_loading: bool,
     ui_hits: Vec<(Rect, UiHit)>,
     ctx_tx: std::sync::mpsc::Sender<context::Request>,
 }
@@ -690,6 +698,227 @@ impl State {
         }
     }
 
+    fn toggle_usage(&mut self) {
+        self.usage_open = !self.usage_open;
+        if self.usage_open {
+            self.load_usage(self.usage_range);
+        }
+        self.window.request_redraw();
+    }
+
+    /// Compute the summary off the UI thread; the thread exits when done.
+    fn load_usage(&mut self, range: usage::Range) {
+        self.usage_range = range;
+        self.usage_loading = true;
+        let proxy = self.proxy.clone();
+        let _ = std::thread::Builder::new().name("usage".into()).spawn(move || {
+            let summary = usage::compute(range);
+            let _ = proxy.send_event(UserEvent::Usage(range, Box::new(summary)));
+        });
+        self.window.request_redraw();
+    }
+
+    /// Full-window usage dashboard.
+    fn usage_chrome(&mut self, out: &mut Vec<Chrome>) {
+        let s = self.scale();
+        let size = self.window.inner_size();
+        let (w, h) = (size.width as f32, size.height as f32);
+        out.push(Chrome::Rect { rect: Rect { x: 0.0, y: 0.0, w, h }, color: GUTTER });
+        let m = 28.0 * s;
+        let cw = w - 2.0 * m;
+        let mut y = BAR_H * s;
+
+        // Header: title, period, range switch, esc.
+        out.push(label(m, y, "Uso de Claude Code".into(), Face::Sans, 18.0 * s, true, theme::FOREGROUND, cw / 2.0));
+        let period = self.usage.as_ref().map_or(String::new(), |u| {
+            let from = if u.days <= 1 { "hoy".to_string() } else { short_date(u.first_day) };
+            if u.days <= 1 { from } else { format!("{from} – hoy") }
+        });
+        out.push(label(m, y + 26.0 * s, period, Face::Sans, 12.5 * s, false, theme::MUTED, cw / 2.0));
+        let ranges = [(usage::Range::Days(7), "7 días"), (usage::Range::Days(30), "30 días"), (usage::Range::Days(90), "90 días"), (usage::Range::All, "Todo")];
+        let px = 12.5 * s;
+        let widths: Vec<f32> = ranges.iter().map(|(_, t)| self.fonts.run(t, Face::Sans, px, false).width + 24.0 * s).collect();
+        let esc_w = self.fonts.run("esc", Face::Sans, 11.0 * s, false).width + 16.0 * s;
+        let seg_w: f32 = widths.iter().sum::<f32>() + 6.0 * s;
+        let seg_x = w - m - esc_w - 12.0 * s - seg_w;
+        out.push(Chrome::Round { rect: Rect { x: seg_x, y: y + 2.0 * s, w: seg_w, h: 30.0 * s }, radius: 9.0 * s, color: CARD });
+        let mut x = seg_x + 3.0 * s;
+        for ((range, t), tw) in ranges.iter().zip(&widths) {
+            let on = *range == self.usage_range;
+            let r = Rect { x, y: y + 5.0 * s, w: *tw, h: 24.0 * s };
+            if on {
+                out.push(Chrome::Round { rect: r, radius: 7.0 * s, color: SELECTED });
+            }
+            out.push(label(x + 12.0 * s, r.y + (r.h - px * 1.3) / 2.0, (*t).into(), Face::Sans, px, on, if on { theme::FOREGROUND } else { theme::MUTED }, *tw));
+            self.ui_hits.push((r, UiHit::Range(*range)));
+            x += tw;
+        }
+        let esc = Rect { x: w - m - esc_w, y: y + 7.0 * s, w: esc_w, h: 20.0 * s };
+        out.push(Chrome::Round { rect: esc, radius: 6.0 * s, color: CARD });
+        out.push(label(esc.x + 8.0 * s, esc.y + (esc.h - 11.0 * s * 1.3) / 2.0, "esc".into(), Face::Sans, 11.0 * s, false, theme::MUTED, esc_w));
+        self.ui_hits.push((esc, UiHit::CloseUsage));
+        y += 60.0 * s;
+
+        let Some(u) = self.usage.clone() else {
+            out.push(label(m, y, "Leyendo transcripts…".into(), Face::Sans, 13.0 * s, false, theme::MUTED, cw));
+            return;
+        };
+        if self.usage_loading {
+            out.push(label(m + cw / 2.0 - 60.0 * s, BAR_H * s + 30.0 * s, "actualizando…".into(), Face::Sans, 11.5 * s, false, theme::MUTED, 120.0 * s));
+        }
+
+        // KPI cards.
+        let gap = 14.0 * s;
+        let card_w = (cw - 3.0 * gap) / 4.0;
+        let card_h = 124.0 * s;
+        let cards = [
+            ("Tokens de entrada", usage::human(u.input.value), format!("{:.0}% desde caché", u.cache_share * 100.0), &u.input),
+            ("Tokens de salida", usage::human(u.output.value), format!("{} por turno", usage::human(u.per_turn)), &u.output),
+            ("Tareas", usage::human(u.tasks.value), format!("{} turnos", usage::human(u.turns as f64)), &u.tasks),
+            ("Tiempo de agente", usage::duration(u.agent_hours.value), format!("hasta {} a la vez", u.max_concurrent), &u.agent_hours),
+        ];
+        for (i, (title, value, sub, kpi)) in cards.into_iter().enumerate() {
+            let x = m + i as f32 * (card_w + gap);
+            let r = Rect { x, y, w: card_w, h: card_h };
+            out.push(Chrome::Round { rect: r, radius: 12.0 * s, color: PANEL });
+            let pad = 16.0 * s;
+            out.push(label(x + pad, y + 14.0 * s, title.to_uppercase(), Face::Sans, 10.5 * s, true, theme::MUTED, card_w - 2.0 * pad));
+            if let Some(d) = usage::delta(kpi) {
+                let (t, c) = if d >= 0.0 { (format!("+{d:.0}%"), SUCCESS) } else { (format!("{d:.0}%"), ERROR) };
+                let pw = self.fonts.run(&t, Face::Sans, 10.5 * s, true).width + 14.0 * s;
+                self.pill(out, x + card_w - pad - pw, y + 12.0 * s, &t, c, PANEL);
+            }
+            out.push(label(x + pad, y + 32.0 * s, value, Face::Sans, 30.0 * s, false, theme::FOREGROUND, card_w - 2.0 * pad));
+            out.push(label(x + pad, y + 74.0 * s, sub, Face::Sans, 12.0 * s, false, theme::MUTED, card_w - 2.0 * pad));
+            spark(out, &kpi.series, Rect { x: x + pad, y: y + 96.0 * s, w: card_w - 2.0 * pad, h: 18.0 * s }, mix(theme::MUTED, PANEL, 0.75), s);
+        }
+        y += card_h + 26.0 * s;
+
+        // Tokens per day (60%) and heatmap (40%).
+        let row_h = 190.0 * s;
+        let left_w = (cw - gap) * 0.58;
+        let right_x = m + left_w + 2.0 * gap;
+        let right_w = cw - left_w - 2.0 * gap;
+        let per_day = u.input.value / u.days.max(1) as f64;
+        section_head(self, out, m, y, left_w, "Tokens por día", &format!("{} de {} días con actividad · {}/día", u.active_days, u.days, usage::human(per_day)), s);
+        let busiest = (0..7).flat_map(|d| (0..24).map(move |hr| (d, hr))).max_by_key(|&(d, hr)| u.heat[d][hr]).unwrap_or((0, 0));
+        let busy = if u.heat[busiest.0][busiest.1] > 0 { format!("más activo {} {} h", WEEKDAYS[busiest.0], busiest.1) } else { String::new() };
+        section_head(self, out, right_x, y, right_w, "Cuándo trabajan", &busy, s);
+        let top = y + 30.0 * s;
+        self.tokens_chart(out, &u, Rect { x: m, y: top, w: left_w, h: row_h - 30.0 * s });
+        self.heatmap(out, &u, Rect { x: right_x, y: top, w: right_w, h: row_h - 30.0 * s });
+        y += row_h + 24.0 * s;
+
+        // Models and projects.
+        let half = (cw - 2.0 * gap) / 2.0;
+        let models: Vec<usage::Row> = u.models.iter().map(|r| usage::Row { name: usage::model_name(&r.name), ..r.clone() }).collect();
+        section_head(self, out, m, y, half, "Modelos", &format!("{} modelos", u.models_total), s);
+        section_head(self, out, m + half + 2.0 * gap, y, half, "Proyectos", &format!("{} proyectos", u.projects_total), s);
+        y += 30.0 * s;
+        self.usage_table(out, &models, Rect { x: m, y, w: half, h: h - y - 16.0 * s }, "tareas", |v| usage::human(v), theme::ACCENT);
+        self.usage_table(out, &u.projects, Rect { x: m + half + 2.0 * gap, y, w: half, h: h - y - 16.0 * s }, "tiempo", |v| usage::duration(v / 3600.0), mix(theme::FOREGROUND, GUTTER, 0.55));
+    }
+
+    fn tokens_chart(&mut self, out: &mut Vec<Chrome>, u: &usage::Summary, r: Rect) {
+        let s = self.scale();
+        let max_in = u.daily_in.iter().copied().max().unwrap_or(0).max(1) as f32;
+        let max_out = u.daily_out.iter().copied().max().unwrap_or(0).max(1) as f32;
+        let label_w = 64.0 * s;
+        let plot = Rect { x: r.x + label_w, y: r.y, w: r.w - label_w, h: r.h - 22.0 * s };
+        let mid = plot.y + plot.h * 0.66;
+        let (up, down) = (plot.h * 0.64, plot.h * 0.32);
+        out.push(label(r.x, plot.y, usage::human(max_in as f64), Face::Sans, 13.0 * s, true, theme::FOREGROUND, label_w));
+        out.push(label(r.x, plot.y + 18.0 * s, "entrada".into(), Face::Sans, 11.5 * s, false, theme::MUTED, label_w));
+        out.push(label(r.x, mid + 6.0 * s, usage::human(max_out as f64), Face::Sans, 13.0 * s, true, theme::FOREGROUND, label_w));
+        out.push(label(r.x, mid + 24.0 * s, "salida".into(), Face::Sans, 11.5 * s, false, theme::ACCENT, label_w));
+        let n = u.days.max(1) as f32;
+        let slot = plot.w / n;
+        let bar = (slot * 0.68).max(1.0);
+        for (i, (a, b)) in u.daily_in.iter().zip(&u.daily_out).enumerate() {
+            let x = plot.x + i as f32 * slot + (slot - bar) / 2.0;
+            let hi = (*a as f32 / max_in * up).max(if *a > 0 { s } else { 0.0 });
+            let ho = (*b as f32 / max_out * down).max(if *b > 0 { s } else { 0.0 });
+            out.push(Chrome::Rect { rect: Rect { x, y: mid - hi, w: bar, h: hi }, color: [0x3D, 0x50, 0x59] });
+            out.push(Chrome::Rect { rect: Rect { x, y: mid + s, w: bar, h: ho }, color: theme::ACCENT });
+        }
+        out.push(Chrome::Rect { rect: Rect { x: plot.x, y: mid, w: plot.w, h: s }, color: HAIRLINE });
+        let ly = plot.y + plot.h + 6.0 * s;
+        let px = 11.0 * s;
+        out.push(label(plot.x, ly, short_date(u.first_day), Face::Sans, px, false, theme::MUTED, 80.0 * s));
+        if u.days > 2 {
+            let mid_day = u.first_day + (u.days / 2) as i64;
+            let t = short_date(mid_day);
+            let tw = self.fonts.run(&t, Face::Sans, px, false).width;
+            out.push(label(plot.x + (u.days / 2) as f32 * slot + slot / 2.0 - tw / 2.0, ly, t, Face::Sans, px, false, theme::MUTED, tw + s));
+        }
+        let tw = self.fonts.run("hoy", Face::Sans, px, false).width;
+        out.push(label(plot.x + plot.w - tw, ly, "hoy".into(), Face::Sans, px, false, theme::MUTED, tw + s));
+    }
+
+    fn heatmap(&mut self, out: &mut Vec<Chrome>, u: &usage::Summary, r: Rect) {
+        let s = self.scale();
+        let label_w = 18.0 * s;
+        let cell = ((r.w - label_w) / 24.0).min((r.h - 40.0 * s) / 7.0).floor();
+        let g = (cell * 0.12).max(s).round();
+        let max = u.heat.iter().flatten().copied().max().unwrap_or(0).max(1) as f32;
+        let px = 10.5 * s;
+        for (d, row) in u.heat.iter().enumerate() {
+            let y = r.y + d as f32 * cell;
+            out.push(label(r.x, y + (cell - px * 1.3) / 2.0, WEEKDAYS[d][..1].to_uppercase(), Face::Sans, px, false, theme::MUTED, label_w));
+            for (hr, v) in row.iter().enumerate() {
+                let color = if *v == 0 { CARD } else { mix(theme::FOREGROUND, CARD, 0.15 + 0.85 * (*v as f32 / max).powf(0.6)) };
+                let c = Rect { x: r.x + label_w + hr as f32 * cell, y, w: cell - g, h: cell - g };
+                out.push(Chrome::Round { rect: c, radius: 2.0 * s, color });
+            }
+        }
+        let ly = r.y + 7.0 * cell + 4.0 * s;
+        for hr in [0, 6, 12, 18] {
+            out.push(label(r.x + label_w + hr as f32 * cell, ly, hr.to_string(), Face::Sans, px, false, theme::MUTED, 30.0 * s));
+        }
+        // Legend: less → more.
+        let lx = r.x + label_w + 24.0 * cell - 4.0 * (cell * 0.6 + 2.0 * s) - 70.0 * s;
+        out.push(label(lx, ly + 16.0 * s, "menos".into(), Face::Sans, px, false, theme::MUTED, 40.0 * s));
+        for i in 0..4 {
+            let color = mix(theme::FOREGROUND, CARD, 0.15 + 0.85 * (i as f32 / 3.0).powf(0.6));
+            let x = lx + 38.0 * s + i as f32 * (cell * 0.6 + 2.0 * s);
+            out.push(Chrome::Round { rect: Rect { x, y: ly + 19.0 * s, w: cell * 0.6, h: cell * 0.6 }, radius: 2.0 * s, color });
+        }
+        out.push(label(lx + 42.0 * s + 4.0 * (cell * 0.6 + 2.0 * s), ly + 16.0 * s, "más".into(), Face::Sans, px, false, theme::MUTED, 30.0 * s));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn usage_table(&mut self, out: &mut Vec<Chrome>, rows: &[usage::Row], r: Rect, third: &str, fmt: impl Fn(f64) -> String, bar_color: Rgb) {
+        let s = self.scale();
+        let px = 12.5 * s;
+        let col = 72.0 * s;
+        let (c3, c2, c1) = (r.x + r.w, r.x + r.w - col, r.x + r.w - 2.0 * col);
+        let name_w = r.w * 0.36;
+        let bar_x = r.x + name_w + 8.0 * s;
+        let bar_max = (c1 - col - bar_x).max(10.0 * s);
+        let right = |fonts: &mut Fonts, out: &mut Vec<Chrome>, x_end: f32, y: f32, t: String, color: Rgb, px: f32| {
+            let tw = fonts.run(&t, Face::Sans, px, false).width;
+            out.push(label(x_end - tw, y, t, Face::Sans, px, false, color, tw + 1.0));
+        };
+        let hy = r.y;
+        for (x, t) in [(c1, "entrada"), (c2, "salida"), (c3, third)] {
+            right(&mut self.fonts, out, x, hy, t.into(), theme::MUTED, 11.0 * s);
+        }
+        let mut y = hy + 22.0 * s;
+        for row in rows {
+            if y + 22.0 * s > r.y + r.h {
+                break;
+            }
+            let rest = row.name.ends_with(" más");
+            out.push(label(r.x, y, row.name.clone(), Face::Sans, px, false, if rest { theme::MUTED } else { theme::FOREGROUND }, name_w));
+            let bw = (row.share as f32 * bar_max).max(3.0 * s);
+            out.push(Chrome::Round { rect: Rect { x: bar_x, y: y + 6.0 * s, w: bw, h: 6.0 * s }, radius: 3.0 * s, color: if rest { HAIRLINE } else { bar_color } });
+            right(&mut self.fonts, out, c1, y, usage::human(row.input as f64), theme::FOREGROUND, px);
+            right(&mut self.fonts, out, c2, y, usage::human(row.output as f64), theme::FOREGROUND, px);
+            right(&mut self.fonts, out, c3, y, fmt(row.third), theme::MUTED, px);
+            y += 25.0 * s;
+        }
+    }
+
     /// Activate the tab holding `id` and focus it.
     fn jump_to(&mut self, id: PaneId) {
         if let Some(i) = self.tabs.list.iter().position(|t| t.root.contains(id)) {
@@ -1015,6 +1244,7 @@ impl State {
                 self.panel = !self.panel;
                 self.relayout();
             }
+            "u" => self.toggle_usage(),
             "=" | "+" => self.set_font_size(self.font_points + 1.0),
             "-" => self.set_font_size(self.font_points - 1.0),
             "0" => self.set_font_size(self.config.font.size),
@@ -1106,6 +1336,10 @@ impl ApplicationHandler<UserEvent> for App {
             next_tick: Instant::now(),
             panel: true,
             panel_changes: false,
+            usage_open: false,
+            usage_range: usage::Range::Days(30),
+            usage: None,
+            usage_loading: false,
             ui_hits: vec![],
             ctx_tx: {
                 let proxy = self.proxy.clone();
@@ -1124,6 +1358,14 @@ impl ApplicationHandler<UserEvent> for App {
         let Some(st) = self.state.as_mut() else { return };
         let (id, event) = match event {
             UserEvent::Term(id, event) => (id, event),
+            UserEvent::Usage(range, summary) => {
+                if range == st.usage_range {
+                    st.usage = Some(summary);
+                    st.usage_loading = false;
+                    st.window.request_redraw();
+                }
+                return;
+            }
             UserEvent::Context(update) => {
                 match update {
                     context::Update::Context(id, ctx) => {
@@ -1235,6 +1477,21 @@ impl ApplicationHandler<UserEvent> for App {
                 st.window.request_redraw();
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+                if st.usage_open {
+                    if event.logical_key == Key::Named(NamedKey::Escape) {
+                        st.toggle_usage();
+                    } else if st.mods.super_key() {
+                        let plain = event.key_without_modifiers();
+                        if let Key::Character(c) = &plain {
+                            match c.as_str() {
+                                "u" => st.toggle_usage(),
+                                "q" => event_loop.exit(),
+                                _ => {}
+                            }
+                        }
+                    }
+                    return;
+                }
                 if let Some((_, buf)) = st.renaming.as_mut() {
                     match input::edit_line(buf, &event.logical_key, event.text.as_deref(), st.mods) {
                         input::Edit::Continue => st.window.request_redraw(),
@@ -1311,11 +1568,16 @@ impl ApplicationHandler<UserEvent> for App {
                 let pressed = state == ElementState::Pressed;
                 let (x, y) = (st.mouse.x as f32, st.mouse.y as f32);
                 if pressed && button == MouseButton::Left {
-                    let hit = st.ui_hits.iter().find(|(r, _)| r.contains(x, y)).map(|(_, h)| match h {
-                        UiHit::PanelTab(c) => UiHit::PanelTab(*c),
-                        UiHit::ClosePane(id) => UiHit::ClosePane(*id),
-                    });
+                    let hit = st.ui_hits.iter().find(|(r, _)| r.contains(x, y)).map(|(_, h)| *h);
                     match hit {
+                        Some(UiHit::Range(range)) => {
+                            st.load_usage(range);
+                            return;
+                        }
+                        Some(UiHit::CloseUsage) => {
+                            st.toggle_usage();
+                            return;
+                        }
                         Some(UiHit::PanelTab(c)) => {
                             st.panel_changes = c;
                             st.window.request_redraw();
@@ -1329,6 +1591,9 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                         None => {}
                     }
+                }
+                if st.usage_open {
+                    return;
                 }
                 if pressed && button == MouseButton::Left && x < st.sidebar_w() {
                     if let Some(id) = st.sidebar_hits.iter().find(|(r, _)| r.contains(x, y)).map(|(_, id)| *id) {
@@ -1427,6 +1692,7 @@ impl ApplicationHandler<UserEvent> for App {
                     st.window.request_redraw();
                 }
             }
+            WindowEvent::MouseWheel { .. } if st.usage_open => {}
             WindowEvent::MouseWheel { delta, .. } => {
                 let lines = match delta {
                     MouseScrollDelta::LineDelta(_, y) => (y * 3.0) as i32,
@@ -1442,6 +1708,13 @@ impl ApplicationHandler<UserEvent> for App {
                 st.scroll(id, lines);
             }
             WindowEvent::RedrawRequested => {
+                if st.usage_open {
+                    st.ui_hits.clear();
+                    let mut chrome = vec![];
+                    st.usage_chrome(&mut chrome);
+                    st.renderer.render(&[], &chrome, &mut st.fonts, GUTTER);
+                    return;
+                }
                 let chrome = st.chrome();
                 let focused = st.focused_id();
                 let (rects, _) = st.tab_layout(st.tabs.active);
@@ -1489,6 +1762,56 @@ impl ApplicationHandler<UserEvent> for App {
     }
 }
 
+const WEEKDAYS: [&str; 7] = ["lun", "mar", "mié", "jue", "vie", "sáb", "dom"];
+const MONTHS: [&str; 12] = ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic"];
+
+/// Day number (days since 1970-01-01) → "23 oct".
+fn short_date(day: i64) -> String {
+    // Civil from days (Howard Hinnant).
+    let z = day + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    format!("{d} {}", MONTHS[(m - 1) as usize])
+}
+
+/// Section title on the left, muted info on the right, hairline between.
+#[allow(clippy::too_many_arguments)]
+fn section_head(st: &mut State, out: &mut Vec<Chrome>, x: f32, y: f32, w: f32, title: &str, info: &str, s: f32) {
+    let px = 10.5 * s;
+    let t = title.to_uppercase();
+    let tw = st.fonts.run(&t, Face::Sans, px, true).width;
+    let iw = st.fonts.run(info, Face::Sans, 11.5 * s, false).width;
+    out.push(label(x, y, t, Face::Sans, px, true, theme::MUTED, w));
+    out.push(label(x + w - iw, y - s, info.into(), Face::Sans, 11.5 * s, false, theme::MUTED, iw + s));
+    let line_x = x + tw + 10.0 * s;
+    let line_w = w - tw - iw - 20.0 * s;
+    if line_w > 0.0 {
+        out.push(Chrome::Rect { rect: Rect { x: line_x, y: y + px * 0.65, w: line_w, h: s }, color: HAIRLINE });
+    }
+}
+
+/// Mini bar chart of a series.
+fn spark(out: &mut Vec<Chrome>, series: &[f64], r: Rect, color: Rgb, s: f32) {
+    let max = series.iter().copied().fold(0.0, f64::max);
+    if series.is_empty() || max <= 0.0 {
+        return;
+    }
+    let slot = r.w / series.len() as f32;
+    let bar = (slot * 0.65).max(1.0);
+    for (i, v) in series.iter().enumerate() {
+        let h = (*v / max) as f32 * r.h;
+        if h > 0.0 {
+            let h = h.max(s);
+            out.push(Chrome::Rect { rect: Rect { x: r.x + i as f32 * slot, y: r.y + r.h - h, w: bar, h }, color });
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn label(x: f32, y: f32, text: String, face: Face, px: f32, bold: bool, color: Rgb, max_w: f32) -> Chrome {
     Chrome::Label { x, y, text, face, px, bold, color, max_w }
@@ -1528,4 +1851,16 @@ fn main() {
     let mut app = App { socket: socket.clone(), config, proxy, state: None };
     event_loop.run_app(&mut app).expect("run");
     let _ = std::fs::remove_file(socket);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dates_and_mix() {
+        assert_eq!(short_date(0), "1 ene");
+        assert_eq!(short_date(20_782), "24 nov"); // 2026-11-24
+        assert_eq!(mix([255, 0, 0], [0, 0, 0], 0.5), [128, 0, 0]);
+    }
 }

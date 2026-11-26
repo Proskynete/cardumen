@@ -44,9 +44,14 @@ size = 14.0
 | Cmd+Option+Arrows | focus the pane in that direction |
 | Cmd+B | show / hide the session sidebar |
 | Cmd+I | show / hide the Resumen panel (step, Claude, PR/MR, changes) |
+| Cmd+U | usage dashboard (Esc closes) |
 | Cmd+Q | quit |
 | Option+←/→ | word left/right (`ESC b` / `ESC f`) |
 | Cmd+←/→, Cmd+⌫ | line start/end, delete line |
+
+## Usage dashboard
+
+Cmd+U shows Claude Code usage read from `~/.claude/projects` (no network): tokens, tasks, agent time, tokens per day, a weekday × hour heatmap, and breakdowns by model and project, for 7 / 30 / 90 days or all time. Parsed data is cached in `~/Library/Caches/cardumen/usage.bin`; the first run reads everything (≈5 s for 3.6 GB), later runs only new bytes (≈30 ms).
 
 ## Measurements (Apple M1, 8 GB, one session)
 
