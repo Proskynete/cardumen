@@ -10,4 +10,4 @@
 
 ## 3. Verify
 
-- [ ] 3.1 Install, open from /Applications, check icon, `echo $SHELL $LANG`, and the shell prompt
+- [x] 3.1 Install, open from /Applications, check icon, `echo $SHELL $LANG`, and the shell prompt
