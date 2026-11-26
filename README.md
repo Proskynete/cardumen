@@ -2,7 +2,7 @@
 
 Mi ADE personal para macOS: una terminal liviana, escrita en Rust, pensada para trabajar con varias sesiones de Claude Code en paralelo y saber en segundos en qué va cada una.
 
-![Cardumen: pestañas por proyecto, sesiones de Claude Code en el sidebar y el panel Resumen](docs/cardumen.png)
+![Cardumen en uso: qué sesión de Claude Code te espera, en qué quedó, qué cambió y tu uso](docs/demo.gif)
 
 Un cardumen es un grupo de peces que nadan juntos. Así trabajo: 4 o 5 proyectos a la vez, cada uno con su sesión de Claude Code. Cardumen no trae IA propia; es el lugar donde esas sesiones viven.
 
