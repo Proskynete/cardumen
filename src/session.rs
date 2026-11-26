@@ -2,6 +2,7 @@
 //! so tabs and splits can hold several later.
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
@@ -13,16 +14,18 @@ use alacritty_terminal::tty;
 use alacritty_terminal::vte::ansi;
 use winit::event_loop::EventLoopProxy;
 
+use crate::layout::PaneId;
+
 pub enum UserEvent {
-    Term(Event),
+    Term(PaneId, Event),
 }
 
 #[derive(Clone)]
-pub struct Listener(pub EventLoopProxy<UserEvent>);
+pub struct Listener(pub EventLoopProxy<UserEvent>, pub PaneId);
 
 impl EventListener for Listener {
     fn send_event(&self, event: Event) {
-        let _ = self.0.send_event(UserEvent::Term(event));
+        let _ = self.0.send_event(UserEvent::Term(self.1, event));
     }
 }
 
@@ -47,6 +50,7 @@ impl Dimensions for GridSize {
 pub struct Session<L: EventListener = Listener> {
     pub term: Arc<FairMutex<Term<L>>>,
     sender: EventLoopSender,
+    pid: u32,
 }
 
 pub fn shell_program() -> String {
@@ -54,7 +58,13 @@ pub fn shell_program() -> String {
 }
 
 impl<L: EventListener + Clone + Send + 'static> Session<L> {
-    pub fn spawn(size: WindowSize, scrollback: usize, listener: L, banner: Option<String>) -> std::io::Result<Self> {
+    pub fn spawn(
+        size: WindowSize,
+        scrollback: usize,
+        listener: L,
+        banner: Option<String>,
+        cwd: Option<PathBuf>,
+    ) -> std::io::Result<Self> {
         let env = HashMap::from([
             ("TERM".to_string(), "xterm-256color".to_string()),
             ("COLORTERM".to_string(), "truecolor".to_string()),
@@ -62,7 +72,7 @@ impl<L: EventListener + Clone + Send + 'static> Session<L> {
         ]);
         let options = tty::Options {
             shell: Some(tty::Shell::new(shell_program(), vec!["-l".into()])),
-            working_directory: std::env::var_os("HOME").map(Into::into),
+            working_directory: cwd.or_else(|| std::env::var_os("HOME").map(Into::into)),
             drain_on_exit: false,
             env,
         };
@@ -78,14 +88,31 @@ impl<L: EventListener + Clone + Send + 'static> Session<L> {
         }
         let term = Arc::new(FairMutex::new(term));
         let pty = tty::new(&options, size, 0)?;
+        let pid = pty.child().id();
         let event_loop = EventLoop::new(term.clone(), listener, pty, false, false)?;
         let sender = event_loop.channel();
         event_loop.spawn();
-        Ok(Self { term, sender })
+        Ok(Self { term, sender, pid })
     }
 
     pub fn write(&self, bytes: impl Into<Cow<'static, [u8]>>) {
         let _ = self.sender.send(Msg::Input(bytes.into()));
+    }
+
+    /// The shell's current directory (what `pwd` prints at the prompt).
+    pub fn cwd(&self) -> Option<PathBuf> {
+        let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as i32;
+        // SAFETY: proc_pidinfo fills at most `size` bytes of the zeroed struct we own;
+        // vip_path is a NUL-terminated C string inside it.
+        unsafe {
+            let mut info: libc::proc_vnodepathinfo = std::mem::zeroed();
+            let n = libc::proc_pidinfo(self.pid as i32, libc::PROC_PIDVNODEPATHINFO, 0, (&raw mut info).cast(), size);
+            if n != size {
+                return None;
+            }
+            let path = std::ffi::CStr::from_ptr(info.pvi_cdir.vip_path.as_ptr().cast());
+            Some(PathBuf::from(path.to_string_lossy().into_owned()))
+        }
     }
 
     pub fn resize(&self, size: WindowSize) {
@@ -126,7 +153,7 @@ mod tests {
 
     fn start(cols: u16) -> (Session<Probe>, mpsc::Receiver<String>) {
         let (tx, rx) = mpsc::channel();
-        let s = Session::spawn(size(cols, 24), 1000, Probe(tx), Some("BANNER\r\n".into())).unwrap();
+        let s = Session::spawn(size(cols, 24), 1000, Probe(tx), Some("BANNER\r\n".into()), None).unwrap();
         (s, rx)
     }
 
@@ -204,6 +231,16 @@ mod tests {
         s.write(vec![3u8]);
         s.write(b"echo after-int\r".to_vec());
         wait("prompt after ^C", 5, || screen(&s).contains("after-int"));
+    }
+
+    #[test]
+    fn starts_in_cwd_and_tracks_cd() {
+        let (tx, _rx) = mpsc::channel();
+        let s = Session::spawn(size(80, 24), 100, Probe(tx), None, Some("/usr".into())).unwrap();
+        ready(&s);
+        assert_eq!(s.cwd().unwrap(), PathBuf::from("/usr"));
+        s.write(b"cd /tmp\r".to_vec());
+        wait("cd", 5, || s.cwd().is_some_and(|p| p.ends_with("tmp")));
     }
 
     #[test]

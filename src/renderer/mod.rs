@@ -117,6 +117,16 @@ pub struct Renderer {
     atlas_reset: bool,
 }
 
+fn solid(x: f32, y: f32, w: f32, h: f32, c: Rgb) -> Quad {
+    Quad { pos: [x, y], size: [w, h], uv: [0.0; 4], color: rgba(c), kind: SOLID, _pad: [0; 3] }
+}
+
+/// Window decoration drawn behind the panes: tab bar, dividers.
+pub enum Chrome {
+    Rect { rect: crate::layout::Rect, color: Rgb },
+    Text { x: f32, y: f32, text: String, color: Rgb, max_w: f32 },
+}
+
 fn rgba(c: Rgb) -> [f32; 4] {
     [c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0, 1.0]
 }
@@ -316,20 +326,10 @@ impl Renderer {
         entry
     }
 
-    /// Returns true when another frame is needed (the atlas was reset mid-frame).
-    pub fn render(&mut self, frame: &Frame, fonts: &mut Fonts, pad: (f32, f32)) -> bool {
-        self.atlas_reset = false;
-        self.quads.clear();
+    /// Queue one terminal frame whose grid starts at `pad` (physical px).
+    fn push_frame(&mut self, frame: &Frame, fonts: &mut Fonts, pad: (f32, f32)) {
         let (cw, ch) = (fonts.cell_w, fonts.cell_h);
         let origin = |col: usize, line: usize| (pad.0 + col as f32 * cw, pad.1 + line as f32 * ch);
-        let solid = |x: f32, y: f32, w: f32, h: f32, c: Rgb| Quad {
-            pos: [x, y],
-            size: [w, h],
-            uv: [0.0; 4],
-            color: rgba(c),
-            kind: SOLID,
-            _pad: [0; 3],
-        };
         let thickness = (fonts.px / 14.0).round().max(1.0);
 
         for cell in &frame.cells {
@@ -389,6 +389,48 @@ impl Renderer {
             }
         }
 
+    }
+
+    /// Queue a text run starting at (x, y = cell top), truncated with `…` past `max_w`.
+    fn push_text(&mut self, fonts: &mut Fonts, x: f32, y: f32, text: &str, color: Rgb, max_w: f32) {
+        let fit = (max_w / fonts.cell_w).floor().max(0.0) as usize;
+        let count = text.chars().count();
+        let chars: Vec<char> = if count > fit {
+            text.chars().take(fit.saturating_sub(1)).chain(std::iter::once('…')).collect()
+        } else {
+            text.chars().collect()
+        };
+        for (i, c) in chars.into_iter().enumerate() {
+            if c == ' ' {
+                continue;
+            }
+            if let Some(e) = self.glyph(fonts, GlyphKey { c, bold: false, italic: false }) {
+                self.quads.push(Quad {
+                    pos: [x + i as f32 * fonts.cell_w + e.left as f32, y + fonts.baseline - e.top as f32],
+                    size: [e.w as f32, e.h as f32],
+                    uv: [e.x as f32, e.y as f32, e.w as f32, e.h as f32],
+                    color: rgba(color),
+                    kind: if e.color { COLOR } else { MASK },
+                    _pad: [0; 3],
+                });
+            }
+        }
+    }
+
+    /// Draw chrome (behind) and every pane frame. Returns true when another frame
+    /// is needed (the atlas was reset mid-frame).
+    pub fn render(&mut self, frames: &[(&Frame, (f32, f32))], chrome: &[Chrome], fonts: &mut Fonts) -> bool {
+        self.atlas_reset = false;
+        self.quads.clear();
+        for item in chrome {
+            match item {
+                Chrome::Rect { rect, color } => self.quads.push(solid(rect.x, rect.y, rect.w, rect.h, *color)),
+                Chrome::Text { x, y, text, color, max_w } => self.push_text(fonts, *x, *y, text, *color, *max_w),
+            }
+        }
+        for (frame, pad) in frames {
+            self.push_frame(frame, fonts, *pad);
+        }
         let screen = [self.config.width as f32, self.config.height as f32, atlas::SIZE as f32, atlas::SIZE as f32];
         self.queue.write_buffer(&self.uniforms, 0, bytemuck::cast_slice(&screen));
         let needed = (self.quads.len() * std::mem::size_of::<Quad>()) as u64;

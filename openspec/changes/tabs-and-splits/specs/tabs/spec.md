@@ -8,11 +8,15 @@ The system SHALL draw a tab bar in the titlebar band, to the right of the window
 - **THEN** the second tab is drawn with the accent line and the first in muted text
 
 ### Requirement: Tab title
-A tab's title SHALL be the title set by the focused pane's program (OSC 0/2). When no title is set, it SHALL be the basename of the focused pane's working directory (`~` for the home directory).
+A tab's title SHALL be the title set by the focused pane's program (OSC 0/2). When no title is set, or the title is the shell prompt's `user@host…` form (it starts with `$USER@`), it SHALL be the basename of the focused pane's working directory (`~` for the home directory).
 
 #### Scenario: Claude Code sets a title
 - **WHEN** Claude Code sets the window title to "✳ Refactor auth"
 - **THEN** the tab shows "✳ Refactor auth"
+
+#### Scenario: Prompt title
+- **WHEN** zsh sets the title to "proskynete@Mini: ~/projects/cardumen"
+- **THEN** the tab shows "cardumen"
 
 ### Requirement: New tab
 Cmd+T and a click on `+` SHALL open a new tab after the active one, running a new login shell in the focused pane's working directory, show the welcome banner, and make it active.

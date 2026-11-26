@@ -43,6 +43,10 @@ The system SHALL let the user select text with a left-drag, select a word with a
 - **WHEN** the user drags across text in the shell
 - **THEN** the cells are highlighted, and Cmd+C copies exactly that text
 
+#### Scenario: Copy on select
+- **WHEN** the user releases the mouse after selecting text (drag, double-click or triple-click)
+- **THEN** the selected text is placed on the clipboard without pressing Cmd+C
+
 ### Requirement: Scrollback
 The system SHALL keep at least 10,000 lines of scrollback (configurable) and scroll it with the trackpad or mouse wheel on the primary screen. On the alternate screen, the wheel SHALL be sent to the application as arrow keys or mouse events.
 

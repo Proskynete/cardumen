@@ -31,8 +31,13 @@ size = 14.0
 
 | Keys | Action |
 |------|--------|
-| Cmd+C / Cmd+V | copy selection / paste |
+| Cmd+C / Cmd+V | copy selection / paste (selecting text also copies it) |
 | Cmd+= / Cmd+- / Cmd+0 | font size bigger / smaller / reset |
+| Cmd+T / Cmd+W | new tab / close pane (closes the tab with its last pane) |
+| Cmd+1…8, Cmd+9 | tab 1–8, last tab |
+| Cmd+Shift+[ / ], Ctrl+Tab | previous / next tab |
+| Cmd+D / Cmd+Shift+D | split right / split down |
+| Cmd+Option+Arrows | focus the pane in that direction |
 | Cmd+Q | quit |
 | Option+←/→ | word left/right (`ESC b` / `ESC f`) |
 | Cmd+←/→, Cmd+⌫ | line start/end, delete line |
@@ -40,6 +45,7 @@ size = 14.0
 ## Measurements (Apple M1, 8 GB, one session)
 
 - Memory: 39 MB `phys_footprint` (from `footprint`)
+- Memory with 3 tabs and 5 shells: 44 MB
 - Idle CPU: 0.0%
 
 ## Specs

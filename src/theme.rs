@@ -7,6 +7,7 @@ pub type Rgb = [u8; 3];
 pub const BACKGROUND: Rgb = [0x09, 0x13, 0x19];
 pub const FOREGROUND: Rgb = [0xED, 0xF4, 0xF3];
 pub const ACCENT: Rgb = [0x35, 0xD6, 0xC0];
+pub const MUTED: Rgb = [0x71, 0x91, 0x9C];
 pub const SELECTION: Rgb = [0x1A, 0x4A, 0x4C];
 
 pub const ANSI: [Rgb; 16] = [
