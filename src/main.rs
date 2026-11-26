@@ -1824,6 +1824,10 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let Some(st) = self.state.as_mut() else { return };
+        // The last tab just closed and the app is quitting: nothing to focus.
+        if st.tabs.list.is_empty() || !st.panes.contains_key(&st.focused_id()) {
+            return;
+        }
         let blinking = st.window_focused && st.focused().session.term.lock().cursor_style().blinking;
         // Elapsed times in the sidebar change every minute; refresh twice a minute.
         let now = Instant::now();
