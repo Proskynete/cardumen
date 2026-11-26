@@ -26,5 +26,5 @@
 
 ## 6. Verify
 
-- [ ] 5.1 Tests pass; screenshot with 3 tabs and a nested split
+- [x] 5.1 Tests pass; screenshot with 3 tabs and a nested split
 - [x] 5.2 Memory with 5 tabs, recorded in the README

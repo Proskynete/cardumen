@@ -40,5 +40,5 @@
 
 ## 7. Verify
 
-- [ ] 7.1 Manual check: zsh prompt with Nerd icons, `claude`, `vim`, `htop`, resize, selection/copy/paste, scrollback
+- [x] 7.1 Manual check: zsh prompt with Nerd icons, `claude`, `vim`, `htop`, resize, selection/copy/paste, scrollback
 - [x] 7.2 Measure RSS with one session (target < 60 MB) and idle CPU; record the numbers in the README
