@@ -83,6 +83,7 @@ enum UiHit {
     ClosePane(PaneId),
     Range(usage::Range),
     CloseUsage,
+    OpenUsage,
 }
 
 enum TabHit {
@@ -131,6 +132,7 @@ struct State {
     usage_range: usage::Range,
     usage: Option<Box<usage::Summary>>,
     usage_loading: bool,
+    footer_hover: bool,
     ui_hits: Vec<(Rect, UiHit)>,
     ctx_tx: std::sync::mpsc::Sender<context::Request>,
 }
@@ -393,6 +395,21 @@ impl State {
         }
         y += 34.0 * s;
 
+        // Footer: button to the usage dashboard.
+        let footer = Rect { x: 8.0 * s, y: height - 44.0 * s, w: w - 16.0 * s, h: 34.0 * s };
+        let hover = footer.contains(self.mouse.x as f32, self.mouse.y as f32);
+        out.push(Chrome::Rect { rect: Rect { x: 0.0, y: footer.y - 8.0 * s, w: w - s, h: s }, color: HAIRLINE });
+        if hover {
+            out.push(Chrome::Round { rect: footer, radius: 8.0 * s, color: CARD });
+        }
+        let fy = footer.y + (footer.h - 12.5 * s * 1.3) / 2.0;
+        out.push(label(footer.x + 10.0 * s, fy, "\u{f080}".into(), Face::Mono, 12.5 * s, false, theme::MUTED, 18.0 * s));
+        out.push(label(footer.x + 32.0 * s, fy, "Uso".into(), Face::Sans, 12.5 * s, false, theme::FOREGROUND, 80.0 * s));
+        let key_w = self.fonts.run("⌘U", Face::Sans, 11.0 * s, false).width;
+        out.push(label(footer.x + footer.w - 10.0 * s - key_w, fy + s, "⌘U".into(), Face::Sans, 11.0 * s, false, theme::MUTED, key_w + s));
+        self.ui_hits.push((footer, UiHit::OpenUsage));
+        let height = footer.y - 12.0 * s;
+
         let focused = self.focused_id();
         let row_w = w - 16.0 * s;
         for (project, rows) in groups {
@@ -402,6 +419,9 @@ impl State {
             out.push(label(18.0 * s, y, project.to_uppercase(), Face::Sans, 10.5 * s, true, theme::MUTED, row_w));
             y += 20.0 * s;
             for (id, tab) in rows {
+                if y + 62.0 * s > height {
+                    break;
+                }
                 let row = Rect { x: 8.0 * s, y, w: row_w, h: 62.0 * s };
                 if id == focused {
                     out.push(Chrome::Round { rect: row, radius: 10.0 * s, color: SELECTED });
@@ -1340,6 +1360,7 @@ impl ApplicationHandler<UserEvent> for App {
             usage_range: usage::Range::Days(30),
             usage: None,
             usage_loading: false,
+            footer_hover: false,
             ui_hits: vec![],
             ctx_tx: {
                 let proxy = self.proxy.clone();
@@ -1530,6 +1551,12 @@ impl ApplicationHandler<UserEvent> for App {
                     st.hovered_tab = hovered;
                     st.window.request_redraw();
                 }
+                // Hover state of the sidebar's "Uso" button.
+                let in_footer = x < st.sidebar_w() && y > st.window.inner_size().height as f32 - 52.0 * s;
+                if in_footer != st.footer_hover {
+                    st.footer_hover = in_footer;
+                    st.window.request_redraw();
+                }
                 let tabs_x = st.tabs_x();
                 if let Some(drag) = st.dragging_tab.as_mut() {
                     if !drag.moving && (x - drag.press_x).abs() > 4.0 * s {
@@ -1574,7 +1601,7 @@ impl ApplicationHandler<UserEvent> for App {
                             st.load_usage(range);
                             return;
                         }
-                        Some(UiHit::CloseUsage) => {
+                        Some(UiHit::CloseUsage | UiHit::OpenUsage) => {
                             st.toggle_usage();
                             return;
                         }

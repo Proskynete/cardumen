@@ -44,7 +44,7 @@ size = 14.0
 | Cmd+Option+Arrows | focus the pane in that direction |
 | Cmd+B | show / hide the session sidebar |
 | Cmd+I | show / hide the Resumen panel (step, Claude, PR/MR, changes) |
-| Cmd+U | usage dashboard (Esc closes) |
+| Cmd+U, or "Uso" at the bottom of the sidebar | usage dashboard (Esc closes) |
 | Cmd+Q | quit |
 | Option+←/→ | word left/right (`ESC b` / `ESC f`) |
 | Cmd+←/→, Cmd+⌫ | line start/end, delete line |

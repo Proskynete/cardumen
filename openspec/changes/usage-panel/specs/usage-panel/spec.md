@@ -34,7 +34,7 @@ The view SHALL show tokens per day (input bars up, output bars down, with the ma
 - **THEN** every card, chart and table recomputes for the last 7 days
 
 ### Requirement: Open and close
-Cmd+U SHALL toggle the view, and Esc SHALL close it. While it is open, the tabs and panes are hidden and keystrokes other than Esc and Cmd shortcuts SHALL NOT reach any shell.
+Cmd+U and a "Uso ⌘U" button at the bottom of the sidebar SHALL open the view; Cmd+U, Esc and the "esc" button SHALL close it. While it is open, the tabs and panes are hidden and keystrokes other than Esc and Cmd shortcuts SHALL NOT reach any shell.
 
 #### Scenario: Esc
 - **WHEN** the view is open and the user presses Esc
