@@ -86,10 +86,20 @@ struct State {
     /// Tab being renamed and its edit buffer.
     renaming: Option<(usize, String)>,
     last_tab_click: Option<(Instant, usize)>,
-    /// Tab being dragged and the pointer x where the press happened.
-    dragging_tab: Option<(usize, f32)>,
+    dragging_tab: Option<TabDrag>,
+    /// Drawn x of each tab (by tab id), eased towards its slot every frame.
+    tab_x: HashMap<u64, f32>,
+    animating: bool,
     hovered_tab: Option<usize>,
     tab_w: f32,
+}
+
+struct TabDrag {
+    index: usize,
+    press_x: f32,
+    /// Pointer x minus the tab's left edge at press time, so the tab doesn't jump.
+    grab: f32,
+    moving: bool,
 }
 
 struct App {
@@ -282,9 +292,32 @@ impl State {
         self.tab_w = tab_w;
         let (top, h) = (5.0 * s, BAR_H * s - 6.0 * s);
         let text_y = top + ((h - ch) / 2.0).round();
+        let mut dragged_chrome = vec![];
+        self.animating = false;
+        let first_x = TABS_X * s;
+        let last_x = first_x + (n - 1.0).max(0.0) * tab_w;
         for i in 0..self.tabs.list.len() {
-            let x = TABS_X * s + i as f32 * tab_w;
+            let slot_x = first_x + i as f32 * tab_w;
+            let tab_id = self.tabs.list[i].id;
+            let drag = self.dragging_tab.as_ref().filter(|d| d.moving && d.index == i);
+            let x = match drag {
+                Some(d) => (self.mouse.x as f32 - d.grab).clamp(first_x, last_x),
+                None => {
+                    // Ease towards the slot; Warp-like slide when tabs swap places.
+                    let cur = self.tab_x.get(&tab_id).copied().unwrap_or(slot_x);
+                    let next = cur + (slot_x - cur) * 0.35;
+                    if (slot_x - next).abs() < 0.5 {
+                        slot_x
+                    } else {
+                        self.animating = true;
+                        next
+                    }
+                }
+            };
+            self.tab_x.insert(tab_id, x);
+            let first = out.len();
             let rect = Rect { x, y: top, w: tab_w - 2.0 * s, h };
+            let slot = Rect { x: slot_x, ..rect };
             let active = i == self.tabs.active;
             if active {
                 out.push(Chrome::Rect { rect, color: TAB_BG });
@@ -316,10 +349,18 @@ impl State {
                 let cx = x + rect.w - TAB_PAD * s / 2.0 - close_w;
                 out.push(Chrome::Text { x: cx + 4.0 * s, y: text_y, text: "×".into(), color: theme::MUTED, max_w: cw });
                 // Close target goes first so it wins over the tab body.
-                self.tab_hits.push((Rect { x: cx, y: top, w: close_w, h }, TabHit::Close(i)));
+                let slot_cx = slot_x + rect.w - TAB_PAD * s / 2.0 - close_w;
+                self.tab_hits.push((Rect { x: slot_cx, y: top, w: close_w, h }, TabHit::Close(i)));
             }
-            self.tab_hits.push((rect, TabHit::Tab(i)));
+            self.tab_hits.push((slot, TabHit::Tab(i)));
+            if drag.is_some() {
+                // The dragged tab is drawn last, on top of the others.
+                dragged_chrome = out.split_off(first);
+            }
         }
+        out.extend(dragged_chrome);
+        let ids: Vec<u64> = self.tabs.list.iter().map(|t| t.id).collect();
+        self.tab_x.retain(|id, _| ids.contains(id));
         let plus_x = TABS_X * s + n * tab_w;
         out.push(Chrome::Text {
             x: plus_x + ((PLUS_W * s - cw) / 2.0).round(),
@@ -590,6 +631,8 @@ impl ApplicationHandler<UserEvent> for App {
             renaming: None,
             last_tab_click: None,
             dragging_tab: None,
+            tab_x: HashMap::new(),
+            animating: false,
             hovered_tab: None,
             tab_w: 0.0,
         };
@@ -714,16 +757,22 @@ impl ApplicationHandler<UserEvent> for App {
                     st.hovered_tab = hovered;
                     st.window.request_redraw();
                 }
-                if let Some((from, start_x)) = st.dragging_tab {
-                    if (x - start_x).abs() > 4.0 * s && st.tab_w > 0.0 {
+                if let Some(drag) = st.dragging_tab.as_mut() {
+                    if !drag.moving && (x - drag.press_x).abs() > 4.0 * s {
+                        drag.moving = true;
+                        st.renaming = None;
+                    }
+                    if drag.moving && st.tab_w > 0.0 {
+                        // Swap once the dragged tab's centre crosses into a neighbour's slot.
                         let n = st.tabs.list.len();
-                        let to = (((x - TABS_X * s) / st.tab_w).floor().max(0.0) as usize).min(n - 1);
+                        let centre = x - drag.grab + st.tab_w / 2.0 - TABS_X * s;
+                        let to = ((centre / st.tab_w).floor().max(0.0) as usize).min(n - 1);
+                        let from = drag.index;
+                        drag.index = to;
                         if to != from {
-                            st.renaming = None;
                             st.tabs.move_tab(from, to);
-                            st.dragging_tab = Some((to, start_x));
-                            st.window.request_redraw();
                         }
+                        st.window.request_redraw();
                     }
                     return;
                 }
@@ -751,7 +800,8 @@ impl ApplicationHandler<UserEvent> for App {
                             let now = Instant::now();
                             let double = st.last_tab_click.is_some_and(|(t, j)| j == i && now - t < MULTI_CLICK);
                             st.last_tab_click = Some((now, i));
-                            st.dragging_tab = Some((i, x));
+                            let slot_x = TABS_X * st.scale() + i as f32 * st.tab_w;
+                            st.dragging_tab = Some(TabDrag { index: i, press_x: x, grab: x - slot_x, moving: false });
                             if double {
                                 st.start_rename(i);
                             } else if st.renaming.as_ref().is_none_or(|(j, _)| *j != i) {
@@ -778,7 +828,9 @@ impl ApplicationHandler<UserEvent> for App {
                     st.commit_rename();
                 }
                 if !pressed {
-                    st.dragging_tab = None;
+                    if st.dragging_tab.take().is_some_and(|d| d.moving) {
+                        st.window.request_redraw();
+                    }
                     // Copy on select: whatever was just selected goes to the clipboard.
                     if let Some(id) = st.selecting.take() {
                         let text = st.panes.get(&id).and_then(|p| p.session.term.lock().selection_to_string());
@@ -859,7 +911,7 @@ impl ApplicationHandler<UserEvent> for App {
                     })
                     .collect();
                 let refs: Vec<(&Frame, (f32, f32))> = frames.iter().map(|(f, o)| (f, *o)).collect();
-                if st.renderer.render(&refs, &chrome, &mut st.fonts) {
+                if st.renderer.render(&refs, &chrome, &mut st.fonts) || st.animating {
                     st.window.request_redraw();
                 }
             }

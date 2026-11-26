@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: Reorder tabs
-Dragging a tab horizontally by more than 4 points SHALL move it to the slot under the pointer, shifting the other tabs. The dragged tab SHALL stay active. Cmd+Shift+Left and Cmd+Shift+Right SHALL move the active tab one slot left or right (no wrap).
+Dragging a tab horizontally by more than 4 points SHALL lift it: it follows the pointer (keeping the grab offset, clamped to the tab bar) and is drawn above the others. When its centre crosses into a neighbour's slot, they swap, and the other tabs slide to their new slots with an eased animation. On release, the dragged tab slides into its slot. The dragged tab SHALL stay active. Cmd+Shift+Left and Cmd+Shift+Right SHALL move the active tab one slot left or right (no wrap).
 
 #### Scenario: Drag first tab to the end
 - **WHEN** tabs A, B, C exist and the user drags A over C's slot and releases
