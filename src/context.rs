@@ -331,16 +331,17 @@ fn git(repo: &Path, args: &[&str]) -> Option<String> {
     run("git", args, repo, Duration::from_secs(5)).ok()
 }
 
-fn changes(repo: &Path) -> Option<Changes> {
-    let base = ["origin/HEAD", "origin/main", "origin/master"]
+/// What changes are measured against: the merge base with the remote default branch, else `HEAD`.
+pub fn diff_base(repo: &Path) -> String {
+    ["origin/HEAD", "origin/main", "origin/master"]
         .iter()
         .find_map(|b| git(repo, &["merge-base", "HEAD", b]))
-        .map(|s| s.trim().to_string());
+        .map_or_else(|| "HEAD".to_string(), |s| s.trim().to_string())
+}
+
+fn changes(repo: &Path) -> Option<Changes> {
     // Working tree against the merge base, so uncommitted work counts too.
-    let numstat = match &base {
-        Some(b) => git(repo, &["diff", "--numstat", b])?,
-        None => git(repo, &["diff", "--numstat", "HEAD"])?,
-    };
+    let numstat = git(repo, &["diff", "--numstat", &diff_base(repo)])?;
     let mut c = parse_numstat(&numstat);
     c.unpushed = git(repo, &["rev-list", "--count", "@{u}..HEAD"]).and_then(|s| s.trim().parse().ok());
     Some(c)

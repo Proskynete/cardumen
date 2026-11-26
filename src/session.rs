@@ -22,6 +22,7 @@ pub enum UserEvent {
     Status(PaneId, Option<crate::status::Claude>, crate::status::Hook),
     Context(crate::context::Update),
     Usage(crate::usage::Range, Box<crate::usage::Summary>),
+    Diff(std::path::PathBuf, Box<crate::diff::Diff>),
 }
 
 #[derive(Clone)]
