@@ -2,7 +2,8 @@
 pub type PaneId = u64;
 
 /// `Right` puts children side by side; `Down` stacks them.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Dir {
     Right,
     Down,
