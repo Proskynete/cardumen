@@ -36,6 +36,8 @@ size = 14.0
 | Cmd+= / Cmd+- / Cmd+0 | font size bigger / smaller / reset |
 | Cmd+T / Cmd+W | new tab / close pane (closes the tab with its last pane) |
 | Cmd+Shift+R, double-click a tab | rename the tab (Enter saves, Esc cancels, empty = automatic title) |
+| Drag a tab, Cmd+Shift+←/→ | move the tab |
+| `×` on a tab | close the tab and all its panes |
 | Cmd+1…8, Cmd+9 | tab 1–8, last tab |
 | Cmd+Shift+[ / ], Ctrl+Tab | previous / next tab |
 | Cmd+D / Cmd+Shift+D | split right / split down |

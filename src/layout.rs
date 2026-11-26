@@ -168,6 +168,22 @@ impl Tabs {
         }
     }
 
+    /// Move tab `from` to slot `to`; the active tab stays the same tab.
+    pub fn move_tab(&mut self, from: usize, to: usize) {
+        let n = self.list.len();
+        if from >= n || to >= n || from == to {
+            return;
+        }
+        let tab = self.list.remove(from);
+        self.list.insert(to, tab);
+        self.active = match self.active {
+            a if a == from => to,
+            a if from < a && to >= a => a - 1,
+            a if from > a && to <= a => a + 1,
+            a => a,
+        };
+    }
+
     pub fn cycle(&mut self, forward: bool) {
         let n = self.list.len();
         self.active = if forward { (self.active + 1) % n } else { (self.active + n - 1) % n };
@@ -278,6 +294,25 @@ mod tests {
         assert_eq!(t.active().focused, 3);
         t.remove_pane(3);
         assert!(t.list.is_empty());
+    }
+
+    #[test]
+    fn move_tab_keeps_active() {
+        let mut t = Tabs::default();
+        for id in [1, 2, 3] {
+            t.open(id);
+        }
+        let order = |t: &Tabs| t.list.iter().map(|x| x.focused).collect::<Vec<_>>();
+        t.select(0);
+        t.move_tab(0, 2);
+        assert_eq!(order(&t), [2, 3, 1]);
+        assert_eq!(t.active, 2);
+        t.select(1); // tab 3 active
+        t.move_tab(2, 0);
+        assert_eq!(order(&t), [1, 2, 3]);
+        assert_eq!(t.active().focused, 3);
+        t.move_tab(0, 5); // out of range: no-op
+        assert_eq!(order(&t), [1, 2, 3]);
     }
 
     #[test]

@@ -58,6 +58,7 @@ struct Pane {
 
 enum TabHit {
     Tab(usize),
+    Close(usize),
     New,
 }
 
@@ -85,6 +86,10 @@ struct State {
     /// Tab being renamed and its edit buffer.
     renaming: Option<(usize, String)>,
     last_tab_click: Option<(Instant, usize)>,
+    /// Tab being dragged and the pointer x where the press happened.
+    dragging_tab: Option<(usize, f32)>,
+    hovered_tab: Option<usize>,
+    tab_w: f32,
 }
 
 struct App {
@@ -227,6 +232,16 @@ impl State {
         false
     }
 
+    /// Close tab `i` and all its panes. Returns true when no tabs are left.
+    fn close_tab(&mut self, i: usize) -> bool {
+        let Some(tab) = self.tabs.list.get(i) else { return false };
+        let mut quit = false;
+        for id in tab.root.leaves() {
+            quit = self.close_pane(id);
+        }
+        quit
+    }
+
     fn tab_title(&self, i: usize) -> String {
         if let Some(name) = &self.tabs.list[i].name {
             return name.clone();
@@ -264,6 +279,7 @@ impl State {
         let n = self.tabs.list.len() as f32;
         let room = width - TABS_X * s - PLUS_W * s - 2.0 * PAD * s;
         let tab_w = (room / n).min(TAB_MAX_W * s).floor();
+        self.tab_w = tab_w;
         let (top, h) = (5.0 * s, BAR_H * s - 6.0 * s);
         let text_y = top + ((h - ch) / 2.0).round();
         for i in 0..self.tabs.list.len() {
@@ -277,7 +293,9 @@ impl State {
                     color: theme::ACCENT,
                 });
             }
-            let max_w = rect.w - 2.0 * TAB_PAD * s;
+            let show_close = active || self.hovered_tab == Some(i);
+            let close_w = cw + 8.0 * s;
+            let max_w = rect.w - 2.0 * TAB_PAD * s - if show_close { close_w } else { 0.0 };
             let (text, editing) = match &self.renaming {
                 Some((j, buf)) if *j == i => (buf.clone(), true),
                 _ => (self.tab_title(i), false),
@@ -294,6 +312,12 @@ impl State {
                 color: if active { theme::FOREGROUND } else { theme::MUTED },
                 max_w,
             });
+            if show_close {
+                let cx = x + rect.w - TAB_PAD * s / 2.0 - close_w;
+                out.push(Chrome::Text { x: cx + 4.0 * s, y: text_y, text: "×".into(), color: theme::MUTED, max_w: cw });
+                // Close target goes first so it wins over the tab body.
+                self.tab_hits.push((Rect { x: cx, y: top, w: close_w, h }, TabHit::Close(i)));
+            }
             self.tab_hits.push((rect, TabHit::Tab(i)));
         }
         let plus_x = TABS_X * s + n * tab_w;
@@ -432,6 +456,19 @@ impl State {
         if !m.super_key() {
             return false;
         }
+        if m.shift_key() && !m.alt_key() {
+            let a = self.tabs.active;
+            let to = match key {
+                Key::Named(NamedKey::ArrowLeft) => a.checked_sub(1),
+                Key::Named(NamedKey::ArrowRight) => Some(a + 1),
+                _ => None,
+            };
+            if let Some(to) = to {
+                self.tabs.move_tab(a, to);
+                self.window.request_redraw();
+                return true;
+            }
+        }
         if m.alt_key() {
             let arrow = match key {
                 Key::Named(NamedKey::ArrowLeft) => Arrow::Left,
@@ -552,6 +589,9 @@ impl ApplicationHandler<UserEvent> for App {
             pressed_button: None,
             renaming: None,
             last_tab_click: None,
+            dragging_tab: None,
+            hovered_tab: None,
+            tab_w: 0.0,
         };
         st.new_tab();
         if st.tabs.list.is_empty() {
@@ -665,6 +705,28 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 st.mouse = position;
+                let (x, y, s) = (position.x as f32, position.y as f32, st.scale());
+                let hovered = st.tab_hits.iter().find_map(|(r, h)| match h {
+                    TabHit::Tab(i) | TabHit::Close(i) if r.contains(x, y) => Some(*i),
+                    _ => None,
+                });
+                if hovered != st.hovered_tab {
+                    st.hovered_tab = hovered;
+                    st.window.request_redraw();
+                }
+                if let Some((from, start_x)) = st.dragging_tab {
+                    if (x - start_x).abs() > 4.0 * s && st.tab_w > 0.0 {
+                        let n = st.tabs.list.len();
+                        let to = (((x - TABS_X * s) / st.tab_w).floor().max(0.0) as usize).min(n - 1);
+                        if to != from {
+                            st.renaming = None;
+                            st.tabs.move_tab(from, to);
+                            st.dragging_tab = Some((to, start_x));
+                            st.window.request_redraw();
+                        }
+                    }
+                    return;
+                }
                 if let Some(id) = st.selecting {
                     let (point, side, _, _) = st.point_in(id);
                     if let Some(sel) = st.panes[&id].session.term.lock().selection.as_mut() {
@@ -689,12 +751,20 @@ impl ApplicationHandler<UserEvent> for App {
                             let now = Instant::now();
                             let double = st.last_tab_click.is_some_and(|(t, j)| j == i && now - t < MULTI_CLICK);
                             st.last_tab_click = Some((now, i));
+                            st.dragging_tab = Some((i, x));
                             if double {
                                 st.start_rename(i);
                             } else if st.renaming.as_ref().is_none_or(|(j, _)| *j != i) {
                                 st.commit_rename();
                                 st.tabs.select(i);
                                 st.after_tab_change();
+                            }
+                        }
+                        Some(TabHit::Close(i)) => {
+                            let i = *i;
+                            st.commit_rename();
+                            if st.close_tab(i) {
+                                event_loop.exit();
                             }
                         }
                         Some(TabHit::New) => st.new_tab(),
@@ -708,6 +778,7 @@ impl ApplicationHandler<UserEvent> for App {
                     st.commit_rename();
                 }
                 if !pressed {
+                    st.dragging_tab = None;
                     // Copy on select: whatever was just selected goes to the clipboard.
                     if let Some(id) = st.selecting.take() {
                         let text = st.panes.get(&id).and_then(|p| p.session.term.lock().selection_to_string());
@@ -753,6 +824,11 @@ impl ApplicationHandler<UserEvent> for App {
                 st.panes[&id].session.term.lock().selection = Some(Selection::new(ty, point, side));
                 st.selecting = Some(id);
                 st.window.request_redraw();
+            }
+            WindowEvent::CursorLeft { .. } => {
+                if st.hovered_tab.take().is_some() {
+                    st.window.request_redraw();
+                }
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let lines = match delta {
