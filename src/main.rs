@@ -544,27 +544,6 @@ impl State {
         w
     }
 
-    /// Greedy word wrap by measured width.
-    fn wrap_px(&mut self, text: &str, px: f32, max_w: f32) -> Vec<String> {
-        let mut lines = vec![];
-        for para in text.lines() {
-            let mut line = String::new();
-            for word in para.split_whitespace() {
-                let candidate = if line.is_empty() { word.to_string() } else { format!("{line} {word}") };
-                if !line.is_empty() && self.fonts.run(&candidate, Face::Sans, px, false).width > max_w {
-                    lines.push(std::mem::replace(&mut line, word.to_string()));
-                } else {
-                    line = candidate;
-                }
-            }
-            lines.push(line);
-        }
-        while lines.last().is_some_and(String::is_empty) {
-            lines.pop();
-        }
-        lines
-    }
-
     /// Markdown wrapped to `max_w`: each visual line is a list of (x offset, word, style).
     fn wrap_md(&mut self, md: &str, px: f32, max_w: f32) -> Vec<Vec<MdWord>> {
         use markdown::Style;
@@ -758,44 +737,72 @@ impl State {
         }
         y += card_h + 16.0 * s;
 
-        // PR / MR.
-        section(out, &mut y, if ctx.provider == Some(context::Provider::GitLab) { "Merge request" } else { "Pull request" });
-        match &ctx.pr {
-            context::PrInfo::Found(pr) => {
-                let color = match pr.state {
-                    context::PrState::Open => theme::ACCENT,
-                    context::PrState::Approved => SUCCESS,
-                    context::PrState::ChangesRequested => WARM,
-                    context::PrState::Draft => theme::MUTED,
-                    context::PrState::Merged => MERGED,
-                    context::PrState::Closed => ERROR,
-                };
-                let mut lines = self.wrap_px(&pr.title, body_px, tw - 24.0 * s);
-                lines.truncate(2);
-                let card_h = 20.0 * s + 24.0 * s + lines.len() as f32 * line_h;
-                out.push(Chrome::Round { rect: Rect { x: left, y, w: tw, h: card_h }, radius: 12.0 * s, color: CARD });
-                self.pill(out, left + 12.0 * s, y + 10.0 * s, &format!("{} {}", pr.number, pr.state.label()), color, CARD);
-                if links::is_web(&pr.url) {
-                    self.ui_hits.push((Rect { x: left, y, w: tw, h: card_h }, UiHit::Link(self.links.len())));
-                    self.links.push(pr.url.clone());
-                }
-                let mut cy = y + 34.0 * s;
-                for l in lines {
-                    out.push(label(left + 12.0 * s, cy, l, Face::Sans, body_px, false, theme::FOREGROUND, tw - 24.0 * s));
-                    cy += line_h;
-                }
-                y += card_h + 16.0 * s;
-            }
-            other => {
-                let msg = match other {
-                    context::PrInfo::None => "Sin PR/MR para esta rama".to_string(),
-                    context::PrInfo::Error(e) => e.clone(),
-                    _ => "Remote sin GitHub/GitLab".to_string(),
-                };
-                out.push(label(left, y, msg, Face::Sans, 12.0 * s, false, theme::MUTED, tw));
-                y += 30.0 * s;
+        // PR / MR: this branch's (even if merged) first, then the newest open ones.
+        let gitlab = ctx.provider == Some(context::Provider::GitLab);
+        let total = ctx.open.total;
+        let count = match total {
+            0 => String::new(),
+            n if n >= context::PR_LIST_LIMIT => format!(" · {n}+ abiertos"),
+            1 => " · 1 abierto".into(),
+            n => format!(" · {n} abiertos"),
+        };
+        section(out, &mut y, &format!("{}{count}", if gitlab { "Merge requests" } else { "Pull requests" }));
+        let mine = match &ctx.pr {
+            context::PrInfo::Found(pr) => Some(pr),
+            _ => None,
+        };
+        let mut rows: Vec<&context::Pr> = mine.filter(|m| !ctx.open.list.contains(m)).into_iter().collect();
+        for pr in &ctx.open.list {
+            if rows.len() < context::PR_LIST_SHOWN {
+                rows.push(pr);
             }
         }
+        if rows.is_empty() {
+            let msg = match &ctx.pr {
+                context::PrInfo::Error(e) => e.clone(),
+                context::PrInfo::Unknown => "Remote sin GitHub/GitLab".to_string(),
+                _ => "Sin PR/MR abiertos".to_string(),
+            };
+            out.push(label(left, y, msg, Face::Sans, 12.0 * s, false, theme::MUTED, tw));
+            y += 30.0 * s;
+        }
+        for pr in rows {
+            let color = match pr.state {
+                context::PrState::Open => theme::ACCENT,
+                context::PrState::Approved => SUCCESS,
+                context::PrState::ChangesRequested => WARM,
+                context::PrState::Draft => theme::MUTED,
+                context::PrState::Merged => MERGED,
+                context::PrState::Closed => ERROR,
+            };
+            let card_h = 20.0 * s + 24.0 * s + line_h;
+            out.push(Chrome::Round { rect: Rect { x: left, y, w: tw, h: card_h }, radius: 12.0 * s, color: CARD });
+            let pw = self.pill(out, left + 12.0 * s, y + 10.0 * s, &format!("{} {}", pr.number, pr.state.label()), color, CARD);
+            if mine == Some(pr) {
+                out.push(label(left + 20.0 * s + pw, y + 13.0 * s, "esta rama".into(), Face::Sans, 11.0 * s, false, theme::MUTED, tw - pw - 32.0 * s));
+            }
+            if links::is_web(&pr.url) {
+                self.ui_hits.push((Rect { x: left, y, w: tw, h: card_h }, UiHit::Link(self.links.len())));
+                self.links.push(pr.url.clone());
+            }
+            out.push(label(left + 12.0 * s, y + 34.0 * s, pr.title.clone(), Face::Sans, body_px, false, theme::FOREGROUND, tw - 24.0 * s));
+            y += card_h + 8.0 * s;
+        }
+        // More open than shown: link to the full list.
+        let shown_open = ctx.open.list.len().min(context::PR_LIST_SHOWN);
+        if total > shown_open {
+            let url = ctx.open.list.first().and_then(|p| links::pr_list_url(&p.url));
+            let text = format!("Ver los {}{} abiertos", total, if total >= context::PR_LIST_LIMIT { "+" } else { "" });
+            let w = self.fonts.run(&text, Face::Sans, 12.0 * s, false).width;
+            let color = if url.is_some() { theme::ACCENT } else { theme::MUTED };
+            out.push(label(left, y, text, Face::Sans, 12.0 * s, false, color, tw));
+            if let Some(url) = url {
+                self.ui_hits.push((Rect { x: left, y, w, h: 18.0 * s }, UiHit::Link(self.links.len())));
+                self.links.push(url);
+            }
+            y += 26.0 * s;
+        }
+        y += 8.0 * s;
 
         section(out, &mut y, "Cambios");
         self.changes_list(out, &ctx, left, tw, y, height, 3);

@@ -50,6 +50,19 @@ pub struct Pr {
     pub url: String,
 }
 
+/// Open PRs/MRs of the repository: the newest few, plus how many there are.
+#[derive(Clone, PartialEq, Debug, Default)]
+pub struct OpenPrs {
+    pub list: Vec<Pr>,
+    /// Capped at `PR_LIST_LIMIT`.
+    pub total: usize,
+}
+
+/// Open PRs fetched to count them; at this many the panel shows "100+".
+pub const PR_LIST_LIMIT: usize = 100;
+/// Open PRs shown in the panel.
+pub const PR_LIST_SHOWN: usize = 3;
+
 #[derive(Clone, PartialEq, Debug)]
 pub enum PrInfo {
     Unknown,
@@ -120,6 +133,7 @@ pub struct Context {
     pub spec: Option<Spec>,
     pub changes: Option<Changes>,
     pub pr: PrInfo,
+    pub open: OpenPrs,
     pub provider: Option<Provider>,
 }
 
@@ -231,7 +245,22 @@ pub fn parse_numstat(out: &str) -> Changes {
 }
 
 pub fn parse_gh(json: &str) -> Option<Pr> {
+    gh_pr(&serde_json::from_str(json).ok()?)
+}
+
+pub fn parse_glab(json: &str) -> Option<Pr> {
+    glab_mr(&serde_json::from_str(json).ok()?)
+}
+
+/// A `gh pr list` / `glab mr list` JSON array: the newest `PR_LIST_SHOWN` and the count.
+pub fn parse_list(json: &str, item: fn(&Value) -> Option<Pr>) -> Option<OpenPrs> {
     let v: Value = serde_json::from_str(json).ok()?;
+    let all = v.as_array()?;
+    let list = all.iter().filter_map(item).take(PR_LIST_SHOWN).collect();
+    Some(OpenPrs { list, total: all.len() })
+}
+
+fn gh_pr(v: &Value) -> Option<Pr> {
     let state = match (v["state"].as_str()?, v["isDraft"].as_bool().unwrap_or(false), v["reviewDecision"].as_str()) {
         ("MERGED", ..) => PrState::Merged,
         ("CLOSED", ..) => PrState::Closed,
@@ -243,8 +272,7 @@ pub fn parse_gh(json: &str) -> Option<Pr> {
     Some(Pr { number: format!("#{}", v["number"].as_u64()?), title: v["title"].as_str()?.to_string(), state, url: v["url"].as_str().unwrap_or_default().into() })
 }
 
-pub fn parse_glab(json: &str) -> Option<Pr> {
-    let v: Value = serde_json::from_str(json).ok()?;
+fn glab_mr(v: &Value) -> Option<Pr> {
     let draft = v["draft"].as_bool().or(v["work_in_progress"].as_bool()).unwrap_or(false);
     let state = match v["state"].as_str()? {
         "merged" => PrState::Merged,
@@ -381,6 +409,21 @@ fn pull_request(repo: &Path, provider: Option<Provider>) -> PrInfo {
     }
 }
 
+/// Open PRs/MRs of the repo, newest first; empty when the CLI is missing or fails.
+fn open_prs(repo: &Path, provider: Option<Provider>) -> OpenPrs {
+    let timeout = Duration::from_secs(15);
+    let limit = PR_LIST_LIMIT.to_string();
+    let (out, item): (_, fn(&Value) -> Option<Pr>) = match provider {
+        Some(Provider::GitHub) => (
+            run("gh", &["pr", "list", "--state", "open", "--limit", &limit, "--json", "number,title,state,isDraft,reviewDecision,url"], repo, timeout),
+            gh_pr,
+        ),
+        Some(Provider::GitLab) => (run("glab", &["mr", "list", "-F", "json", "--per-page", &limit], repo, timeout), glab_mr),
+        None => return OpenPrs::default(),
+    };
+    out.ok().and_then(|json| parse_list(&json, item)).unwrap_or_default()
+}
+
 pub enum Request {
     /// Current panes and their shell pids.
     Panes(Vec<(PaneId, u32)>),
@@ -470,12 +513,12 @@ fn worker(rx: Receiver<Request>, send: impl Fn(Update) -> bool, cwd_of: fn(u32) 
             }
             let remote = git(&repo, &["remote", "get-url", "origin"]).unwrap_or_default();
             let prov = provider(&remote);
-            let prev_pr = st.ctx.as_ref().map_or(PrInfo::Unknown, |c| c.pr.clone());
-            let pr = if pr_due {
+            let prev = st.ctx.as_ref().map_or((PrInfo::Unknown, OpenPrs::default()), |c| (c.pr.clone(), c.open.clone()));
+            let (pr, open) = if pr_due {
                 st.pr_at = Some((Instant::now(), branch_now.clone()));
-                pull_request(&repo, prov)
+                (pull_request(&repo, prov), open_prs(&repo, prov))
             } else {
-                prev_pr
+                prev
             };
             let ctx = Context {
                 repo: repo.clone(),
@@ -483,6 +526,7 @@ fn worker(rx: Receiver<Request>, send: impl Fn(Update) -> bool, cwd_of: fn(u32) 
                 spec: openspec(&repo),
                 changes: changes(&repo),
                 pr,
+                open,
                 provider: prov,
             };
             st.git_at = Some(Instant::now());
@@ -605,6 +649,19 @@ mod tests {
         assert_eq!(parse_glab(gl).unwrap().url, "https://gl.dev/a/-/merge_requests/17");
         assert_eq!(parse_glab(gl).unwrap().state, PrState::Open);
         assert_eq!(parse_glab(r#"{"iid":3,"title":"x","state":"merged"}"#).unwrap().state, PrState::Merged);
+    }
+
+    #[test]
+    fn pr_lists_keep_newest_three_and_count() {
+        let item = |n: u32| format!(r#"{{"number":{n},"title":"t{n}","state":"OPEN","isDraft":false,"reviewDecision":""}}"#);
+        let json = format!("[{}]", (1..=5).rev().map(item).collect::<Vec<_>>().join(","));
+        let open = parse_list(&json, gh_pr).unwrap();
+        assert_eq!(open.total, 5);
+        assert_eq!(open.list.iter().map(|p| p.number.as_str()).collect::<Vec<_>>(), ["#5", "#4", "#3"]);
+        let gl = r#"[{"iid":9,"title":"a","state":"opened"},{"iid":8,"title":"b","state":"opened","draft":true}]"#;
+        let open = parse_list(gl, glab_mr).unwrap();
+        assert_eq!((open.total, open.list[1].state.clone()), (2, PrState::Draft));
+        assert_eq!(parse_list("[]", gh_pr).unwrap(), OpenPrs::default());
     }
 
     #[test]
