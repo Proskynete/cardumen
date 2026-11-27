@@ -123,6 +123,18 @@ fn encode_named(key: NamedKey, mods: ModifiersState, app_cursor: bool) -> Option
     })
 }
 
+/// Backslash-escapes a path for the shell, like Terminal.app does on drop.
+pub fn shell_escape(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for c in path.chars() {
+        if !(c.is_alphanumeric() || "/._-+,:@%".contains(c)) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 pub enum Edit {
     Continue,
     Commit,
@@ -194,6 +206,12 @@ mod tests {
         assert_eq!(named(NamedKey::Tab, ModifiersState::SHIFT, false), b"\x1b[Z");
         assert_eq!(named(NamedKey::Delete, ModifiersState::CONTROL, false), b"\x1b[3;5~");
         assert_eq!(named(NamedKey::F5, ModifiersState::empty(), false), b"\x1b[15~");
+    }
+
+    #[test]
+    fn escapes_dropped_paths() {
+        assert_eq!(shell_escape("/Users/a/Captura de pantalla (1).png"), "/Users/a/Captura\\ de\\ pantalla\\ \\(1\\).png");
+        assert_eq!(shell_escape("/tmp/añadido.png"), "/tmp/añadido.png");
     }
 
     #[test]

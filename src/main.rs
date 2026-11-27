@@ -4,6 +4,7 @@ mod diff;
 mod font;
 mod input;
 mod layout;
+mod markdown;
 mod renderer;
 mod session;
 mod session_file;
@@ -533,6 +534,47 @@ impl State {
         lines
     }
 
+    /// Markdown wrapped to `max_w`: each visual line is a list of (x offset, word, style).
+    fn wrap_md(&mut self, md: &str, px: f32, max_w: f32) -> Vec<Vec<(f32, String, markdown::Style)>> {
+        use markdown::Style;
+        let mut out: Vec<Vec<(f32, String, Style)>> = vec![];
+        for line in markdown::parse(md) {
+            if line.spans.first().is_some_and(|sp| sp.style == Style::Code) && line.spans.len() == 1 && line.prefix.is_empty() {
+                // Fenced code: one line, clipped by the label's max width.
+                out.push(vec![(0.0, line.spans[0].text.clone(), Style::Code)]);
+                continue;
+            }
+            let indent = if line.prefix.is_empty() { 0.0 } else { self.fonts.run(line.prefix, Face::Sans, px, false).width };
+            let space = self.fonts.run(" ", Face::Sans, px, false).width;
+            let mut cur = if line.prefix.is_empty() { vec![] } else { vec![(0.0, line.prefix.to_string(), Style::Plain)] };
+            let (mut x, mut words, mut pending) = (indent, 0, false);
+            for span in &line.spans {
+                for (i, word) in span.text.split(' ').enumerate() {
+                    pending |= i > 0;
+                    if word.is_empty() {
+                        continue;
+                    }
+                    let (face, bold) = md_face(span.style);
+                    let w = self.fonts.run(word, face, px, bold).width;
+                    let mut sp = if pending && words > 0 { space } else { 0.0 };
+                    if words > 0 && x + sp + w > max_w {
+                        out.push(std::mem::take(&mut cur));
+                        (x, sp) = (indent, 0.0);
+                    }
+                    cur.push((x + sp, word.to_string(), span.style));
+                    x += sp + w;
+                    words += 1;
+                    pending = false;
+                }
+            }
+            out.push(cur);
+        }
+        while out.last().is_some_and(Vec::is_empty) {
+            out.pop();
+        }
+        out
+    }
+
     /// Right "Resumen" panel for the focused pane: step, Claude, PR/MR, changes.
     fn panel_chrome(&mut self, out: &mut Vec<Chrome>) {
         let pw = self.panel_w();
@@ -645,12 +687,16 @@ impl State {
             (Some(_), _, None) => (Some(("trabajando", theme::ACCENT)), None),
             (None, _, None) => (None, Some("Sin sesión de Claude en este panel.".into())),
         };
-        let mut lines = text.map(|t| self.wrap_px(&t, body_px, tw - 24.0 * s)).unwrap_or_default();
+        let mut lines = text.map(|t| self.wrap_md(&t, body_px, tw - 24.0 * s)).unwrap_or_default();
         let cut = lines.len() > 8;
         lines.truncate(8);
         if cut {
             if let Some(l) = lines.last_mut() {
-                l.push('…');
+                let x = l.last().map_or(0.0, |(x, w, st)| {
+                    let (face, bold) = md_face(*st);
+                    x + self.fonts.run(w, face, body_px, bold).width
+                });
+                l.push((x, "…".into(), markdown::Style::Plain));
             }
         }
         let card_h = 20.0 * s + lines.len() as f32 * line_h + if pill.is_some() { 24.0 * s } else { 0.0 };
@@ -661,7 +707,15 @@ impl State {
             cy += 24.0 * s;
         }
         for l in lines {
-            out.push(label(left + 12.0 * s, cy, l, Face::Sans, body_px, false, BODY, tw - 24.0 * s));
+            for (dx, word, st) in l {
+                let (face, bold) = md_face(st);
+                let color = match st {
+                    markdown::Style::Plain => BODY,
+                    markdown::Style::Bold => theme::FOREGROUND,
+                    markdown::Style::Code => theme::ACCENT,
+                };
+                out.push(label(left + 12.0 * s + dx, cy, word, face, body_px, bold, color, tw - 24.0 * s - dx));
+            }
             cy += line_h;
         }
         y += card_h + 16.0 * s;
@@ -1473,7 +1527,17 @@ impl State {
     }
 
     fn paste(&mut self) {
-        let Some(text) = self.clipboard.as_mut().and_then(|cb| cb.get_text().ok()) else { return };
+        let Some(cb) = self.clipboard.as_mut() else { return };
+        let text = cb.get_text().ok();
+        if let Some(text) = text {
+            self.paste_text(&text);
+        } else if cb.get_image().is_ok() {
+            // Image-only clipboard (a screenshot): Ctrl+V makes Claude Code attach it.
+            self.panes[&self.focused_id()].session.write(vec![0x16]);
+        }
+    }
+
+    fn paste_text(&mut self, text: &str) {
         let session = &self.panes[&self.focused_id()].session;
         let bracketed = session.term.lock().mode().contains(TermMode::BRACKETED_PASTE);
         let bytes = if bracketed {
@@ -1892,6 +1956,11 @@ impl ApplicationHandler<UserEvent> for App {
                     session.write(if focused { &b"\x1b[I"[..] } else { &b"\x1b[O"[..] });
                 }
                 st.reset_blink();
+                st.window.request_redraw();
+            }
+            // Finder drag: paste the escaped path, which Claude Code turns into an attachment.
+            WindowEvent::DroppedFile(path) if st.diff.is_none() && !st.usage_open && st.renaming.is_none() => {
+                st.paste_text(&format!("{} ", input::shell_escape(&path.to_string_lossy())));
                 st.window.request_redraw();
             }
             WindowEvent::Ime(Ime::Preedit(text, _)) => {
@@ -2326,6 +2395,14 @@ fn spark(out: &mut Vec<Chrome>, series: &[f64], r: Rect, color: Rgb, s: f32) {
             let h = h.max(s);
             out.push(Chrome::Rect { rect: Rect { x: r.x + i as f32 * slot, y: r.y + r.h - h, w: bar, h }, color });
         }
+    }
+}
+
+fn md_face(style: markdown::Style) -> (Face, bool) {
+    match style {
+        markdown::Style::Plain => (Face::Sans, false),
+        markdown::Style::Bold => (Face::Sans, true),
+        markdown::Style::Code => (Face::Mono, false),
     }
 }
 
