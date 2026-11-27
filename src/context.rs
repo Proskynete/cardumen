@@ -373,7 +373,7 @@ fn tool_path(current: Option<&str>) -> String {
     dirs.join(":")
 }
 
-fn run(program: &str, args: &[&str], dir: &Path, timeout: Duration) -> Result<String, String> {
+pub fn run(program: &str, args: &[&str], dir: &Path, timeout: Duration) -> Result<String, String> {
     let mut child = Command::new(program)
         .args(args)
         .env("PATH", tool_path(std::env::var("PATH").ok().as_deref()))
