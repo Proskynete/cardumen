@@ -3,6 +3,7 @@ mod context;
 mod diff;
 mod dock;
 mod font;
+mod fuzzy;
 mod input;
 mod layout;
 mod links;
@@ -109,6 +110,24 @@ enum UiHit {
     Link(usize),
 }
 
+/// Quick switcher (Cmd+P).
+struct Switcher {
+    query: String,
+    sel: usize,
+    /// Row hit-boxes from the last draw, in item order.
+    rows: Vec<Rect>,
+}
+
+/// A quick-switcher row.
+struct SwitchItem {
+    title: String,
+    project: String,
+    waiting: bool,
+    tab: usize,
+}
+
+const SWITCHER_ROWS: usize = 8;
+
 /// Full diff over the pane area.
 struct DiffView {
     repo: PathBuf,
@@ -184,6 +203,7 @@ struct State {
     search: Option<search::Search>,
     /// Multi-line paste waiting for Enter, since the app did not enable bracketed paste: (pane, text, lines).
     pending_paste: Option<(PaneId, String, usize)>,
+    switcher: Option<Switcher>,
     /// Number shown on the Dock icon.
     badge: usize,
     diff: Option<DiffView>,
@@ -1397,6 +1417,136 @@ impl State {
         }
     }
 
+    /// Cmd+J: the session waiting longest, then the next one on each press.
+    fn jump_waiting(&mut self) {
+        let waiting = self.panes.iter().filter_map(|(id, p)| p.claude.filter(|c| c.claude == status::Claude::Waiting).map(|c| (*id, c.since))).collect();
+        if let Some(id) = status::next_waiting(waiting, self.focused_id()) {
+            self.jump_to(id);
+        }
+    }
+
+    fn toggle_switcher(&mut self) {
+        self.switcher = match self.switcher.take() {
+            None if self.diff.is_none() && !self.usage_open => {
+                let sel = if self.tabs.active < SWITCHER_ROWS { self.tabs.active } else { 0 };
+                Some(Switcher { query: String::new(), sel, rows: vec![] })
+            }
+            _ => None,
+        };
+        self.window.request_redraw();
+    }
+
+    /// Tabs matching the switcher's query, best first (tab order on ties), at most `SWITCHER_ROWS`.
+    fn switcher_items(&self) -> Vec<SwitchItem> {
+        let query = self.switcher.as_ref().map_or("", |sw| sw.query.as_str());
+        let waiting = |id: &PaneId| self.panes.get(id).is_some_and(|p| p.claude.is_some_and(|c| c.claude == status::Claude::Waiting));
+        let mut scored: Vec<(i32, SwitchItem)> = (0..self.tabs.list.len())
+            .filter_map(|i| {
+                let tab = &self.tabs.list[i];
+                let (title, project) = (self.tab_title(i), project_name(self.panes.get(&tab.focused).and_then(|p| p.session.cwd())));
+                let score = fuzzy::score(query, &format!("{title} {project}"))?;
+                Some((score, SwitchItem { title, project, waiting: tab.root.leaves().iter().any(waiting), tab: i }))
+            })
+            .collect();
+        scored.sort_by_key(|(score, _)| -score);
+        scored.into_iter().map(|(_, item)| item).take(SWITCHER_ROWS).collect()
+    }
+
+    /// Open row `i` of the switcher (if it exists) and close it.
+    fn switcher_open(&mut self, i: usize) {
+        if let Some(item) = self.switcher_items().into_iter().nth(i) {
+            self.switcher = None;
+            self.jump_to(self.tabs.list[item.tab].focused);
+        }
+    }
+
+    /// Switcher keys; nothing reaches the pane while it is open.
+    fn switcher_key(&mut self, key: &Key, plain: &Key, text: Option<&str>, event_loop: &ActiveEventLoop) {
+        let n = self.switcher_items().len();
+        let Some(sw) = self.switcher.as_mut() else { return };
+        match key {
+            Key::Named(NamedKey::ArrowUp) => sw.sel = sw.sel.saturating_sub(1),
+            Key::Named(NamedKey::ArrowDown) => sw.sel = (sw.sel + 1).min(n.saturating_sub(1)),
+            Key::Named(NamedKey::Enter) => {
+                let i = sw.sel;
+                self.switcher_open(i);
+            }
+            Key::Named(NamedKey::Escape) => self.switcher = None,
+            _ if self.mods.super_key() => match plain {
+                Key::Character(c) if c.as_str() == "p" => self.switcher = None,
+                Key::Character(c) if c.as_str() == "q" => event_loop.exit(),
+                Key::Character(c) if c.as_str() == "v" => {
+                    let text = self.clipboard.as_mut().and_then(|cb| cb.get_text().ok()).unwrap_or_default();
+                    if let Some(sw) = self.switcher.as_mut() {
+                        sw.query.push_str(text.lines().next().unwrap_or(""));
+                        sw.sel = 0;
+                    }
+                }
+                _ => {}
+            },
+            _ => {
+                let before = sw.query.clone();
+                input::edit_line(&mut sw.query, key, text, self.mods);
+                if sw.query != before {
+                    sw.sel = 0;
+                }
+            }
+        }
+        self.window.request_redraw();
+    }
+
+    /// The switcher box, drawn over the panes.
+    fn switcher_chrome(&mut self) -> Vec<Chrome> {
+        let mut out = vec![];
+        if self.switcher.is_none() {
+            return out;
+        }
+        let items = self.switcher_items();
+        let s = self.scale();
+        let area = self.content_rect();
+        let w = (520.0 * s).min(area.w - 40.0 * s);
+        let (field_h, row_h) = (40.0 * s, 32.0 * s);
+        let h = field_h + 12.0 * s + row_h * items.len().max(1) as f32;
+        let (x, y) = (area.x + (area.w - w) / 2.0, area.y + 24.0 * s);
+        out.push(Chrome::Round { rect: Rect { x: x - s, y: y - s, w: w + 2.0 * s, h: h + 2.0 * s }, radius: 13.0 * s, color: HAIRLINE });
+        out.push(Chrome::Round { rect: Rect { x, y, w, h }, radius: 12.0 * s, color: PANEL });
+        let px = 13.5 * s;
+        let sw = self.switcher.as_ref().unwrap();
+        let (text, color) = if sw.query.is_empty() && self.preedit.is_empty() {
+            ("Ir a una pestaña…".to_string(), theme::MUTED)
+        } else {
+            (format!("{}{}", sw.query, self.preedit), theme::FOREGROUND)
+        };
+        out.push(label(x + 16.0 * s, y + (field_h - px * 1.3) / 2.0, text, Face::Sans, px, false, color, w - 32.0 * s));
+        out.push(Chrome::Rect { rect: Rect { x, y: y + field_h, w, h: s }, color: HAIRLINE });
+        let sel = sw.sel.min(items.len().saturating_sub(1));
+        let mut rows = vec![];
+        let mut ry = y + field_h + 6.0 * s;
+        if items.is_empty() {
+            out.push(label(x + 16.0 * s, ry + (row_h - px * 1.3) / 2.0, "Sin resultados".into(), Face::Sans, px, false, theme::MUTED, w - 32.0 * s));
+        }
+        for (i, item) in items.iter().enumerate() {
+            let row = Rect { x: x + 6.0 * s, y: ry, w: w - 12.0 * s, h: row_h };
+            if i == sel {
+                out.push(Chrome::Round { rect: row, radius: 8.0 * s, color: CARD });
+            }
+            let ty = ry + (row_h - px * 1.3) / 2.0;
+            if item.waiting {
+                let d = 7.0 * s;
+                out.push(Chrome::Round { rect: Rect { x: x + 16.0 * s, y: ry + (row_h - d) / 2.0, w: d, h: d }, radius: d / 2.0, color: WARM });
+            }
+            let pw = self.fonts.run(&item.project, Face::Sans, 12.0 * s, false).width.min(w * 0.4);
+            out.push(label(x + 30.0 * s, ty, item.title.clone(), Face::Sans, px, i == sel, theme::FOREGROUND, w - pw - 60.0 * s));
+            out.push(label(x + w - 16.0 * s - pw, ty + s, item.project.clone(), Face::Sans, 12.0 * s, false, theme::MUTED, pw + s));
+            rows.push(row);
+            ry += row_h;
+        }
+        if let Some(sw) = self.switcher.as_mut() {
+            sw.rows = rows;
+        }
+        out
+    }
+
     fn update_title(&self) {
         if !self.tabs.list.is_empty() {
             self.window.set_title(&self.tab_title(self.tabs.active));
@@ -1891,6 +2041,8 @@ impl State {
             }
             "d" => self.split(if m.shift_key() { Dir::Down } else { Dir::Right }),
             "f" => self.toggle_search(),
+            "p" => self.toggle_switcher(),
+            "j" => self.jump_waiting(),
             "r" if m.shift_key() => self.start_rename(self.tabs.active),
             "b" => {
                 self.sidebar = !self.sidebar;
@@ -2057,6 +2209,7 @@ impl ApplicationHandler<UserEvent> for App {
             right_alt: false,
             search: None,
             pending_paste: None,
+            switcher: None,
             badge: 0,
             diff: None,
             ctx_tx: {
@@ -2236,6 +2389,9 @@ impl ApplicationHandler<UserEvent> for App {
                 st.preedit.clear();
                 if let Some((_, buf)) = st.renaming.as_mut() {
                     buf.extend(text.chars().filter(|c| !c.is_control()));
+                } else if let Some(sw) = st.switcher.as_mut() {
+                    sw.query.extend(text.chars().filter(|c| !c.is_control()));
+                    sw.sel = 0;
                 } else if let Some(s) = st.search.as_mut() {
                     s.query.extend(text.chars().filter(|c| !c.is_control()));
                     st.search_step(Direction::Left, false);
@@ -2289,6 +2445,11 @@ impl ApplicationHandler<UserEvent> for App {
                         _ => {}
                     }
                     st.window.request_redraw();
+                    return;
+                }
+                if st.switcher.is_some() {
+                    let plain = event.key_without_modifiers();
+                    st.switcher_key(&event.logical_key, &plain, event.text.as_deref(), event_loop);
                     return;
                 }
                 if st.search.is_some() {
@@ -2403,6 +2564,15 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::MouseInput { state, button, .. } => {
                 let pressed = state == ElementState::Pressed;
                 let (x, y) = (st.mouse.x as f32, st.mouse.y as f32);
+                if pressed && st.switcher.is_some() {
+                    // A row opens its tab; anywhere else closes the switcher.
+                    match st.switcher.as_ref().and_then(|sw| sw.rows.iter().position(|r| r.contains(x, y))) {
+                        Some(i) => st.switcher_open(i),
+                        None => st.switcher = None,
+                    }
+                    st.window.request_redraw();
+                    return;
+                }
                 if pressed && button == MouseButton::Left {
                     let hit = st.ui_hits.iter().find(|(r, _)| r.contains(x, y)).map(|(_, h)| *h);
                     match hit {
@@ -2584,10 +2754,11 @@ impl ApplicationHandler<UserEvent> for App {
                     st.ui_hits.clear();
                     let mut chrome = vec![];
                     st.usage_chrome(&mut chrome);
-                    st.renderer.render(&[], &chrome, &mut st.fonts, GUTTER, None);
+                    st.renderer.render(&[], &chrome, &[], &mut st.fonts, GUTTER, None);
                     return;
                 }
                 let chrome = st.chrome();
+                let overlay = st.switcher_chrome();
                 // Hit-boxes were rebuilt: the hand cursor follows panel changes under a still mouse.
                 st.update_pointer();
                 let focused = st.focused_id();
@@ -2601,7 +2772,7 @@ impl ApplicationHandler<UserEvent> for App {
                         let term = pane.session.term.lock();
                         let mut frame = Frame::capture(&term, st.window_focused && is_focused, !is_focused || st.cursor_on);
                         let origin = st.grid_origin(*rect);
-                        if is_focused && st.renaming.is_none() && st.search.is_none() {
+                        if is_focused && st.renaming.is_none() && st.search.is_none() && st.switcher.is_none() {
                             if !st.preedit.is_empty() {
                                 frame.overlay_preedit(&st.preedit);
                             }
@@ -2617,7 +2788,7 @@ impl ApplicationHandler<UserEvent> for App {
                     .collect();
                 let refs: Vec<(&Frame, (f32, f32))> = frames.iter().map(|(f, o)| (f, *o)).collect();
                 let preview = st.preview_rect();
-                if st.renderer.render(&refs, &chrome, &mut st.fonts, GUTTER, preview) || st.animating {
+                if st.renderer.render(&refs, &chrome, &overlay, &mut st.fonts, GUTTER, preview) || st.animating {
                     st.window.request_redraw();
                 }
             }

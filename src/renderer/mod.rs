@@ -154,6 +154,21 @@ fn rgba(c: Rgb) -> [f32; 4] {
 }
 
 impl Renderer {
+    fn push_chrome(&mut self, fonts: &mut Fonts, item: &Chrome) {
+        match item {
+            Chrome::Rect { rect, color } => self.quads.push(solid(rect.x, rect.y, rect.w, rect.h, *color)),
+            Chrome::Round { rect, radius, color } => self.quads.push(Quad {
+                pos: [rect.x, rect.y],
+                size: [rect.w, rect.h],
+                uv: [radius.min(rect.w / 2.0).min(rect.h / 2.0), 0.0, 0.0, 0.0],
+                color: rgba(*color),
+                kind: ROUND,
+                _pad: [0; 3],
+            }),
+            Chrome::Label { x, y, text, face, px, bold, color, max_w } => self.push_label(fonts, *x, *y, text, *face, *px, *bold, *color, *max_w),
+        }
+    }
+
     pub fn new(window: Arc<Window>) -> Self {
         let size = window.inner_size();
         let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
@@ -485,11 +500,14 @@ impl Renderer {
 
     /// Draw chrome (behind) and every pane frame. Returns true when another frame
     /// is needed (the atlas was reset mid-frame).
+    /// `overlay` is chrome drawn over the frames (the quick switcher).
     /// `preview` is where the uploaded image preview goes, on top of everything.
+    #[allow(clippy::too_many_arguments)]
     pub fn render(
         &mut self,
         frames: &[(&Frame, (f32, f32))],
         chrome: &[Chrome],
+        overlay: &[Chrome],
         fonts: &mut Fonts,
         clear: Rgb,
         preview: Option<crate::layout::Rect>,
@@ -497,23 +515,13 @@ impl Renderer {
         self.atlas_reset = false;
         self.quads.clear();
         for item in chrome {
-            match item {
-                Chrome::Rect { rect, color } => self.quads.push(solid(rect.x, rect.y, rect.w, rect.h, *color)),
-                Chrome::Round { rect, radius, color } => self.quads.push(Quad {
-                    pos: [rect.x, rect.y],
-                    size: [rect.w, rect.h],
-                    uv: [radius.min(rect.w / 2.0).min(rect.h / 2.0), 0.0, 0.0, 0.0],
-                    color: rgba(*color),
-                    kind: ROUND,
-                    _pad: [0; 3],
-                }),
-                Chrome::Label { x, y, text, face, px, bold, color, max_w } => {
-                    self.push_label(fonts, *x, *y, text, *face, *px, *bold, *color, *max_w)
-                }
-            }
+            self.push_chrome(fonts, item);
         }
         for (frame, pad) in frames {
             self.push_frame(frame, fonts, *pad);
+        }
+        for item in overlay {
+            self.push_chrome(fonts, item);
         }
         let preview = preview.filter(|_| self.preview.is_some());
         if let Some(r) = preview {
