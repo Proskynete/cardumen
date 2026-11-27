@@ -8,6 +8,8 @@ alacritty_terminal = "0.26"
 arboard = "3"
 bytemuck = "1"
 cosmic-text = "0.19"
+# Same crate arboard already links; only the decoders the preview needs.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 libc = "0.2"
 pollster = "0.4"
 serde = { version = "1", features = ["derive"] }
