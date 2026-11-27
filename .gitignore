@@ -2,3 +2,4 @@
 /.superpowers
 .zsh_history_project
 /.claude/worktrees
+.DS_Store
