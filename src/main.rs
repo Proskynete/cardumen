@@ -29,7 +29,7 @@ use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
-use winit::platform::macos::{OptionAsAlt, WindowAttributesExtMacOS};
+use winit::platform::macos::WindowAttributesExtMacOS;
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 use winit::window::{CursorIcon, Window, WindowId};
 
@@ -1902,9 +1902,7 @@ impl ApplicationHandler<UserEvent> for App {
             .with_inner_size(LogicalSize::new(1320.0, 820.0))
             .with_titlebar_transparent(true)
             .with_fullsize_content_view(true)
-            .with_title_hidden(true)
-            // Option is Meta (see input::encode); keeps Option dead keys out of the IME.
-            .with_option_as_alt(OptionAsAlt::Both);
+            .with_title_hidden(true);
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
         // Without IME, macOS dead keys (´ + e) never compose into é.
         window.set_ime_allowed(true);
