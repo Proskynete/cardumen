@@ -500,7 +500,21 @@ mod tests {
     fn this_repo() {
         let repo = repo_root(Path::new(env!("CARGO_MANIFEST_DIR"))).unwrap();
         assert!(branch(&repo).is_some());
-        assert!(openspec(&repo).is_some());
+    }
+
+    #[test]
+    fn openspec_skips_archive() {
+        // Fixture dir, not this repo: its active changes come and go.
+        let root = std::env::temp_dir().join(format!("cardumen-openspec-{}", std::process::id()));
+        let changes = root.join("openspec/changes");
+        std::fs::create_dir_all(changes.join("archive/old")).unwrap();
+        std::fs::create_dir_all(changes.join("feat-x")).unwrap();
+        std::fs::write(changes.join("feat-x/tasks.md"), "- [x] a\n- [ ] b\n").unwrap();
+        let spec = openspec(&root).unwrap();
+        assert_eq!((spec.change.as_str(), spec.done, spec.total), ("feat-x", 1, 2));
+        std::fs::remove_dir_all(changes.join("feat-x")).unwrap();
+        assert!(openspec(&root).is_none());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
