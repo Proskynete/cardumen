@@ -46,6 +46,8 @@ pub struct Pr {
     pub number: String,
     pub title: String,
     pub state: PrState,
+    /// Web page of the PR/MR; empty when the CLI did not report one.
+    pub url: String,
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -238,7 +240,7 @@ pub fn parse_gh(json: &str) -> Option<Pr> {
         (_, _, Some("CHANGES_REQUESTED")) => PrState::ChangesRequested,
         _ => PrState::Open,
     };
-    Some(Pr { number: format!("#{}", v["number"].as_u64()?), title: v["title"].as_str()?.to_string(), state })
+    Some(Pr { number: format!("#{}", v["number"].as_u64()?), title: v["title"].as_str()?.to_string(), state, url: v["url"].as_str().unwrap_or_default().into() })
 }
 
 pub fn parse_glab(json: &str) -> Option<Pr> {
@@ -250,7 +252,7 @@ pub fn parse_glab(json: &str) -> Option<Pr> {
         _ if draft => PrState::Draft,
         _ => PrState::Open,
     };
-    Some(Pr { number: format!("!{}", v["iid"].as_u64()?), title: v["title"].as_str()?.to_string(), state })
+    Some(Pr { number: format!("!{}", v["iid"].as_u64()?), title: v["title"].as_str()?.to_string(), state, url: v["web_url"].as_str().unwrap_or_default().into() })
 }
 
 /// One line for a permission request: tool plus its main argument.
@@ -351,7 +353,7 @@ fn pull_request(repo: &Path, provider: Option<Provider>) -> PrInfo {
     let timeout = Duration::from_secs(15);
     match provider {
         Some(Provider::GitHub) => {
-            match run("gh", &["pr", "view", "--json", "number,title,state,isDraft,reviewDecision"], repo, timeout) {
+            match run("gh", &["pr", "view", "--json", "number,title,state,isDraft,reviewDecision,url"], repo, timeout) {
                 Ok(json) => parse_gh(&json).map_or(PrInfo::Error("respuesta de gh no válida".into()), PrInfo::Found),
                 Err(e) if e.contains("no pull requests found") => PrInfo::None,
                 Err(e) => PrInfo::Error(e),
@@ -475,7 +477,7 @@ mod tests {
     }
 
     fn pr(state: PrState) -> PrInfo {
-        PrInfo::Found(Pr { number: "#1".into(), title: "t".into(), state })
+        PrInfo::Found(Pr { number: "#1".into(), title: "t".into(), state, url: String::new() })
     }
 
     #[test]
@@ -529,12 +531,14 @@ mod tests {
 
     #[test]
     fn pr_json() {
-        let gh = r#"{"isDraft":false,"number":42,"reviewDecision":"CHANGES_REQUESTED","state":"OPEN","title":"Add panel"}"#;
-        assert_eq!(parse_gh(gh).unwrap(), Pr { number: "#42".into(), title: "Add panel".into(), state: PrState::ChangesRequested });
+        let gh = r#"{"isDraft":false,"number":42,"reviewDecision":"CHANGES_REQUESTED","state":"OPEN","title":"Add panel","url":"https://github.com/a/b/pull/42"}"#;
+        let url = "https://github.com/a/b/pull/42".to_string();
+        assert_eq!(parse_gh(gh).unwrap(), Pr { number: "#42".into(), title: "Add panel".into(), state: PrState::ChangesRequested, url });
         let gh = r#"{"isDraft":true,"number":7,"reviewDecision":"","state":"OPEN","title":"wip"}"#;
         assert_eq!(parse_gh(gh).unwrap().state, PrState::Draft);
-        let gl = r#"{"iid":17,"title":"Fix","state":"opened","draft":false}"#;
-        assert_eq!(parse_glab(gl).unwrap(), Pr { number: "!17".into(), title: "Fix".into(), state: PrState::Open });
+        let gl = r#"{"iid":17,"title":"Fix","state":"opened","draft":false,"web_url":"https://gl.dev/a/-/merge_requests/17"}"#;
+        assert_eq!(parse_glab(gl).unwrap().url, "https://gl.dev/a/-/merge_requests/17");
+        assert_eq!(parse_glab(gl).unwrap().state, PrState::Open);
         assert_eq!(parse_glab(r#"{"iid":3,"title":"x","state":"merged"}"#).unwrap().state, PrState::Merged);
     }
 

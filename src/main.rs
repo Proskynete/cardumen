@@ -4,6 +4,7 @@ mod diff;
 mod font;
 mod input;
 mod layout;
+mod links;
 mod markdown;
 mod renderer;
 mod session;
@@ -100,6 +101,8 @@ enum UiHit {
     /// A file in the diff viewer's list.
     DiffRow(usize),
     CloseDiff,
+    /// A link in the panel: index into `State::links`.
+    Link(usize),
 }
 
 /// Full diff over the pane area.
@@ -165,6 +168,8 @@ struct State {
     usage_loading: bool,
     footer_hover: bool,
     ui_hits: Vec<(Rect, UiHit)>,
+    /// URLs behind `UiHit::Link`, rebuilt with the hit-boxes every frame.
+    links: Vec<String>,
     diff: Option<DiffView>,
     ctx_tx: std::sync::mpsc::Sender<context::Request>,
     /// Last seen structure (without directories) and when to save it.
@@ -341,6 +346,13 @@ impl State {
             return self.tabs.list.is_empty();
         }
         self.renaming = None;
+        // A drag that started in this pane must not index it after it is gone.
+        if self.selecting == Some(id) {
+            self.selecting = None;
+        }
+        if self.pressed_button.is_some_and(|(p, _)| p == id) {
+            self.pressed_button = None;
+        }
         self.tabs.remove_pane(id);
         self.sync_panes();
         if self.tabs.list.is_empty() {
@@ -535,18 +547,18 @@ impl State {
     }
 
     /// Markdown wrapped to `max_w`: each visual line is a list of (x offset, word, style).
-    fn wrap_md(&mut self, md: &str, px: f32, max_w: f32) -> Vec<Vec<(f32, String, markdown::Style)>> {
+    fn wrap_md(&mut self, md: &str, px: f32, max_w: f32) -> Vec<Vec<MdWord>> {
         use markdown::Style;
-        let mut out: Vec<Vec<(f32, String, Style)>> = vec![];
+        let mut out: Vec<Vec<MdWord>> = vec![];
         for line in markdown::parse(md) {
             if line.spans.first().is_some_and(|sp| sp.style == Style::Code) && line.spans.len() == 1 && line.prefix.is_empty() {
                 // Fenced code: one line, clipped by the label's max width.
-                out.push(vec![(0.0, line.spans[0].text.clone(), Style::Code)]);
+                out.push(vec![MdWord { x: 0.0, text: line.spans[0].text.clone(), style: Style::Code, url: None }]);
                 continue;
             }
             let indent = if line.prefix.is_empty() { 0.0 } else { self.fonts.run(line.prefix, Face::Sans, px, false).width };
             let space = self.fonts.run(" ", Face::Sans, px, false).width;
-            let mut cur = if line.prefix.is_empty() { vec![] } else { vec![(0.0, line.prefix.to_string(), Style::Plain)] };
+            let mut cur = if line.prefix.is_empty() { vec![] } else { vec![MdWord { x: 0.0, text: line.prefix.to_string(), style: Style::Plain, url: None }] };
             let (mut x, mut words, mut pending) = (indent, 0, false);
             for span in &line.spans {
                 for (i, word) in span.text.split(' ').enumerate() {
@@ -561,7 +573,7 @@ impl State {
                         out.push(std::mem::take(&mut cur));
                         (x, sp) = (indent, 0.0);
                     }
-                    cur.push((x + sp, word.to_string(), span.style));
+                    cur.push(MdWord { x: x + sp, text: word.to_string(), style: span.style, url: span.url.clone() });
                     x += sp + w;
                     words += 1;
                     pending = false;
@@ -692,11 +704,11 @@ impl State {
         lines.truncate(8);
         if cut {
             if let Some(l) = lines.last_mut() {
-                let x = l.last().map_or(0.0, |(x, w, st)| {
-                    let (face, bold) = md_face(*st);
-                    x + self.fonts.run(w, face, body_px, bold).width
+                let x = l.last().map_or(0.0, |w| {
+                    let (face, bold) = md_face(w.style);
+                    w.x + self.fonts.run(&w.text, face, body_px, bold).width
                 });
-                l.push((x, "…".into(), markdown::Style::Plain));
+                l.push(MdWord { x, text: "…".into(), style: markdown::Style::Plain, url: None });
             }
         }
         let card_h = 20.0 * s + lines.len() as f32 * line_h + if pill.is_some() { 24.0 * s } else { 0.0 };
@@ -707,14 +719,21 @@ impl State {
             cy += 24.0 * s;
         }
         for l in lines {
-            for (dx, word, st) in l {
-                let (face, bold) = md_face(st);
-                let color = match st {
+            for w in l {
+                let (face, bold) = md_face(w.style);
+                let color = match w.style {
                     markdown::Style::Plain => BODY,
                     markdown::Style::Bold => theme::FOREGROUND,
-                    markdown::Style::Code => theme::ACCENT,
+                    markdown::Style::Code | markdown::Style::Link => theme::ACCENT,
                 };
-                out.push(label(left + 12.0 * s + dx, cy, word, face, body_px, bold, color, tw - 24.0 * s - dx));
+                let wx = left + 12.0 * s + w.x;
+                if let Some(url) = w.url.filter(|u| links::is_web(u)) {
+                    let ww = self.fonts.run(&w.text, face, body_px, bold).width;
+                    out.push(Chrome::Rect { rect: Rect { x: wx, y: cy + line_h - 3.0 * s, w: ww, h: s }, color });
+                    self.ui_hits.push((Rect { x: wx, y: cy, w: ww, h: line_h }, UiHit::Link(self.links.len())));
+                    self.links.push(url);
+                }
+                out.push(label(wx, cy, w.text, face, body_px, bold, color, tw - 24.0 * s - w.x));
             }
             cy += line_h;
         }
@@ -737,6 +756,10 @@ impl State {
                 let card_h = 20.0 * s + 24.0 * s + lines.len() as f32 * line_h;
                 out.push(Chrome::Round { rect: Rect { x: left, y, w: tw, h: card_h }, radius: 12.0 * s, color: CARD });
                 self.pill(out, left + 12.0 * s, y + 10.0 * s, &format!("{} {}", pr.number, pr.state.label()), color, CARD);
+                if links::is_web(&pr.url) {
+                    self.ui_hits.push((Rect { x: left, y, w: tw, h: card_h }, UiHit::Link(self.links.len())));
+                    self.links.push(pr.url.clone());
+                }
                 let mut cy = y + 34.0 * s;
                 for l in lines {
                     out.push(label(left + 12.0 * s, cy, l, Face::Sans, body_px, false, theme::FOREGROUND, tw - 24.0 * s));
@@ -1346,6 +1369,7 @@ impl State {
         let width = self.window.inner_size().width as f32;
         let mut out = vec![];
         self.ui_hits.clear();
+        self.links.clear();
         self.sidebar_chrome(&mut out);
         self.panel_chrome(&mut out);
         if self.diff.is_some() {
@@ -1485,6 +1509,42 @@ impl State {
         let side = if x.fract() < 0.5 { Side::Left } else { Side::Right };
         let offset = pane.session.term.lock().grid().display_offset() as i32;
         (Point::new(Line(line as i32 - offset), Column(col)), side, col, line)
+    }
+
+    /// The web URL under the mouse in pane `id`: an OSC 8 hyperlink, or one
+    /// found in the text of the (soft-wrapped) line.
+    fn url_at(&self, id: PaneId) -> Option<String> {
+        use alacritty_terminal::grid::Dimensions;
+        use alacritty_terminal::term::cell::Flags;
+        let (point, ..) = self.point_in(id);
+        let term = self.panes.get(&id)?.session.term.lock();
+        let grid = term.grid();
+        if let Some(h) = grid[point].hyperlink() {
+            return links::is_web(h.uri()).then(|| h.uri().to_string());
+        }
+        let last = Column(term.columns() - 1);
+        let wraps = |l: i32| grid[Line(l)][last].flags.contains(Flags::WRAPLINE);
+        let (mut top, mut bottom) = (point.line.0, point.line.0);
+        while top > term.topmost_line().0 && wraps(top - 1) {
+            top -= 1;
+        }
+        while bottom < term.bottommost_line().0 && wraps(bottom) {
+            bottom += 1;
+        }
+        let (mut text, mut col) = (String::new(), None);
+        for l in top..=bottom {
+            for c in 0..term.columns() {
+                let p = Point::new(Line(l), Column(c));
+                if grid[p].flags.contains(Flags::WIDE_CHAR_SPACER) {
+                    continue;
+                }
+                if p == point {
+                    col = Some(text.chars().count());
+                }
+                text.push(grid[p].c);
+            }
+        }
+        links::url_at(&text, col?)
     }
 
     fn reset_blink(&mut self) {
@@ -1814,6 +1874,7 @@ impl ApplicationHandler<UserEvent> for App {
             usage_loading: false,
             footer_hover: false,
             ui_hits: vec![],
+            links: vec![],
             diff: None,
             ctx_tx: {
                 let proxy = self.proxy.clone();
@@ -2126,6 +2187,12 @@ impl ApplicationHandler<UserEvent> for App {
                             st.window.request_redraw();
                             return;
                         }
+                        Some(UiHit::Link(i)) => {
+                            if let Some(url) = st.links.get(i) {
+                                links::open(url);
+                            }
+                            return;
+                        }
                         Some(UiHit::ClosePane(id)) => {
                             if st.close_pane(id) {
                                 event_loop.exit();
@@ -2200,6 +2267,12 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 let Some(id) = st.pane_at(x, y) else { return };
                 st.focus(id);
+                if pressed && button == MouseButton::Left && st.mods.super_key()
+                    && let Some(url) = st.url_at(id)
+                {
+                    links::open(&url);
+                    return;
+                }
                 let code = match button {
                     MouseButton::Left => 0,
                     MouseButton::Middle => 1,
@@ -2398,9 +2471,17 @@ fn spark(out: &mut Vec<Chrome>, series: &[f64], r: Rect, color: Rgb, s: f32) {
     }
 }
 
+/// One positioned word of the panel's Markdown.
+struct MdWord {
+    x: f32,
+    text: String,
+    style: markdown::Style,
+    url: Option<String>,
+}
+
 fn md_face(style: markdown::Style) -> (Face, bool) {
     match style {
-        markdown::Style::Plain => (Face::Sans, false),
+        markdown::Style::Plain | markdown::Style::Link => (Face::Sans, false),
         markdown::Style::Bold => (Face::Sans, true),
         markdown::Style::Code => (Face::Mono, false),
     }
@@ -2434,7 +2515,26 @@ fn project_name(cwd: Option<PathBuf>) -> String {
     }
 }
 
+/// Launched from Finder, stderr goes nowhere: keep panics where they can be read.
+fn log_panics() {
+    let Some(home) = std::env::var_os("HOME") else { return };
+    let dir = PathBuf::from(home).join("Library/Logs/Cardumen");
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let bt = std::backtrace::Backtrace::force_capture();
+        let when = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        let thread = std::thread::current().name().unwrap_or("?").to_string();
+        let _ = std::fs::create_dir_all(&dir);
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("panic.log")) {
+            use std::io::Write;
+            let _ = writeln!(f, "--- unix {when} · v{} · thread {thread}\n{info}\n{bt}", env!("CARGO_PKG_VERSION"));
+        }
+        default(info);
+    }));
+}
+
 fn main() {
+    log_panics();
     let config = config::load();
     let event_loop = EventLoop::<UserEvent>::with_user_event().build().expect("event loop");
     let proxy = event_loop.create_proxy();

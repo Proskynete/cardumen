@@ -16,3 +16,7 @@ swash = "0.2"
 toml = "1"
 wgpu = "30"
 winit = "0.30"
+
+[profile.release]
+# Line numbers in panic backtraces (see log_panics in main.rs).
+debug = "line-tables-only"
