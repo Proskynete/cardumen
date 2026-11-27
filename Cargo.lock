@@ -299,6 +299,8 @@ dependencies = [
  "cosmic-text",
  "image",
  "libc",
+ "objc2-app-kit 0.2.2",
+ "objc2-foundation 0.2.2",
  "pollster",
  "serde",
  "serde_json",

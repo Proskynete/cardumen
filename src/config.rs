@@ -22,11 +22,14 @@ pub struct Config {
     pub welcome: bool,
     /// Name shown in the welcome banner; defaults to the macOS full name.
     pub user_name: Option<String>,
+    /// Right Option sends Meta (ESC + key) for shell word motions; left Option
+    /// still types the layout's characters (`@`, `[`, …).
+    pub right_option_meta: bool,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { font: FontConfig::default(), scrollback: 10_000, welcome: true, user_name: None }
+        Self { font: FontConfig::default(), scrollback: 10_000, welcome: true, user_name: None, right_option_meta: false }
     }
 }
 

@@ -60,6 +60,8 @@ Para desarrollo: `cargo run --release`.
 | Cmd+B | mostrar / ocultar el sidebar de sesiones |
 | Cmd+I | mostrar / ocultar el panel Resumen |
 | Cmd+G | ver el diff completo |
+| Cmd+F | buscar en el panel (Enter: anterior, Shift+Enter: siguiente, Esc cierra) |
+| Cmd+clic, Cmd+hover | abrir un link / previsualizar una imagen |
 | Cmd+U | panel de uso (Esc cierra) |
 | Cmd+C / Cmd+V | copiar / pegar (seleccionar también copia) |
 | Cmd+= / Cmd+- / Cmd+0 | tamaño de fuente |
@@ -73,6 +75,7 @@ Opcional, en `~/.config/cardumen/config.toml`:
 scrollback = 10000
 welcome = true                 # Tiburoncín + info del hardware al abrir
 # user_name = "Eduardo Álvarez" # por defecto, tu nombre en macOS
+right_option_meta = false      # true: Option derecha = Meta; la izquierda sigue escribiendo @, [, ~…
 
 [font]
 family = "FiraCode Nerd Font Mono"
