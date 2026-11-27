@@ -297,9 +297,22 @@ pub fn last_text_in(jsonl: &str) -> Option<String> {
 }
 
 /// Run a command with stdin closed and a timeout; `Err` carries a short reason.
+/// `PATH` plus Homebrew's bin dirs: launched from Finder, the app gets only
+/// `/usr/bin:/bin:/usr/sbin:/sbin`, where `gh` and `glab` are not.
+fn tool_path(current: Option<&str>) -> String {
+    let mut dirs: Vec<&str> = current.unwrap_or("").split(':').filter(|d| !d.is_empty()).collect();
+    for extra in ["/opt/homebrew/bin", "/usr/local/bin"] {
+        if !dirs.contains(&extra) {
+            dirs.push(extra);
+        }
+    }
+    dirs.join(":")
+}
+
 fn run(program: &str, args: &[&str], dir: &Path, timeout: Duration) -> Result<String, String> {
     let mut child = Command::new(program)
         .args(args)
+        .env("PATH", tool_path(std::env::var("PATH").ok().as_deref()))
         .current_dir(dir)
         .env("GH_PROMPT_DISABLED", "1")
         .env("NO_PROMPT", "1")
@@ -496,6 +509,13 @@ mod tests {
         assert_eq!(parse_head("ref: refs/heads/feat/x\n"), Some("feat/x".into()));
         assert_eq!(parse_head("0a09939abcdef"), Some("0a09939".into()));
         assert_eq!(count_tasks("## 1\n- [x] 1.1 a\n  - [ ] 1.2 b\n- [X] c\ntext"), (2, 3));
+    }
+
+    #[test]
+    fn tool_path_adds_homebrew() {
+        assert_eq!(tool_path(Some("/usr/bin:/bin")), "/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin");
+        assert_eq!(tool_path(Some("/opt/homebrew/bin:/usr/bin")), "/opt/homebrew/bin:/usr/bin:/usr/local/bin");
+        assert_eq!(tool_path(None), "/opt/homebrew/bin:/usr/local/bin");
     }
 
     #[test]
