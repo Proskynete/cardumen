@@ -172,6 +172,8 @@ struct State {
     links: Vec<String>,
     /// Hand cursor shown: the mouse is over a clickable link.
     pointer: bool,
+    /// Image under the mouse while Cmd is held.
+    preview: Option<Preview>,
     diff: Option<DiffView>,
     ctx_tx: std::sync::mpsc::Sender<context::Request>,
     /// Last seen structure (without directories) and when to save it.
@@ -1516,28 +1518,87 @@ impl State {
     /// Hand cursor over panel links, and over terminal URLs while Cmd is held.
     fn update_pointer(&mut self) {
         let (x, y) = (self.mouse.x as f32, self.mouse.y as f32);
-        let over_link = self.ui_hits.iter().any(|(r, h)| matches!(h, UiHit::Link(_)) && r.contains(x, y))
-            || (self.mods.super_key()
-                && self.diff.is_none()
-                && !self.usage_open
-                && self.pane_at(x, y).is_some_and(|id| self.url_at(id).is_some()));
+        let cmd_pane = (self.mods.super_key() && self.diff.is_none() && !self.usage_open).then(|| self.pane_at(x, y)).flatten();
+        let url = cmd_pane.is_some_and(|id| self.url_at(id).is_some());
+        let image = if url { None } else { cmd_pane.and_then(|id| self.image_at(id)) };
+        let over_link = url || image.is_some() || self.ui_hits.iter().any(|(r, h)| matches!(h, UiHit::Link(_)) && r.contains(x, y));
+        self.hover_image(image);
         if over_link != self.pointer {
             self.pointer = over_link;
             self.window.set_cursor(if over_link { CursorIcon::Pointer } else { CursorIcon::Default });
         }
     }
 
+    /// Show, keep or drop the image preview for the path now under the mouse.
+    fn hover_image(&mut self, path: Option<PathBuf>) {
+        if self.preview.as_ref().map(|p| &p.path) == path.as_ref() {
+            return;
+        }
+        let had_image = self.preview.as_ref().is_some_and(|p| p.size.is_some());
+        self.renderer.set_preview(None);
+        self.preview = path.map(|path| {
+            let max = (PREVIEW_MAX * self.scale()) as u32;
+            let proxy = self.proxy.clone();
+            let p = path.clone();
+            std::thread::spawn(move || {
+                // Skip huge files: decoding them would cost seconds and hundreds of MB.
+                let img = std::fs::metadata(&p).ok().filter(|m| m.len() <= 64 << 20).and_then(|_| image::open(&p).ok()).map(|i| {
+                    let i = if i.width() <= max && i.height() <= max { i } else { i.thumbnail(max, max) };
+                    let i = i.to_rgba8();
+                    (i.width(), i.height(), i.into_raw())
+                });
+                let _ = proxy.send_event(UserEvent::Preview(p, img));
+            });
+            Preview { path, anchor: (self.mouse.x as f32, self.mouse.y as f32), size: None }
+        });
+        if had_image {
+            self.window.request_redraw();
+        }
+    }
+
+    /// Where the preview is drawn: below-right of where the hover started, kept inside the window.
+    fn preview_rect(&self) -> Option<Rect> {
+        let p = self.preview.as_ref()?;
+        let (w, h) = p.size.map(|(w, h)| (w as f32, h as f32))?;
+        let size = self.window.inner_size();
+        let (sw, sh, gap) = (size.width as f32, size.height as f32, 16.0 * self.scale());
+        let x = if p.anchor.0 + gap + w + gap <= sw { p.anchor.0 + gap } else { (p.anchor.0 - gap - w).max(gap) };
+        let y = (p.anchor.1 + gap).min(sh - h - gap).max(gap);
+        Some(Rect { x, y, w, h })
+    }
+
+    /// An existing image file named under the mouse in pane `id`, resolved
+    /// against `~` or the shell's working directory.
+    fn image_at(&self, id: PaneId) -> Option<PathBuf> {
+        let (text, col) = self.line_at(id)?;
+        let raw = links::image_path_at(&text, col)?;
+        let path = match raw.strip_prefix("~/") {
+            Some(rest) => PathBuf::from(std::env::var_os("HOME")?).join(rest),
+            None => PathBuf::from(raw),
+        };
+        let path = if path.is_absolute() { path } else { self.panes.get(&id)?.session.cwd()?.join(path) };
+        path.is_file().then_some(path)
+    }
+
     /// The web URL under the mouse in pane `id`: an OSC 8 hyperlink, or one
     /// found in the text of the (soft-wrapped) line.
     fn url_at(&self, id: PaneId) -> Option<String> {
+        let (point, ..) = self.point_in(id);
+        if let Some(h) = self.panes.get(&id)?.session.term.lock().grid()[point].hyperlink() {
+            return links::is_web(h.uri()).then(|| h.uri().to_string());
+        }
+        let (text, col) = self.line_at(id)?;
+        links::url_at(&text, col)
+    }
+
+    /// Text of the (soft-wrapped) line under the mouse in pane `id`, and the
+    /// char index of the mouse column in it.
+    fn line_at(&self, id: PaneId) -> Option<(String, usize)> {
         use alacritty_terminal::grid::Dimensions;
         use alacritty_terminal::term::cell::Flags;
         let (point, ..) = self.point_in(id);
         let term = self.panes.get(&id)?.session.term.lock();
         let grid = term.grid();
-        if let Some(h) = grid[point].hyperlink() {
-            return links::is_web(h.uri()).then(|| h.uri().to_string());
-        }
         let last = Column(term.columns() - 1);
         let wraps = |l: i32| grid[Line(l)][last].flags.contains(Flags::WRAPLINE);
         let (mut top, mut bottom) = (point.line.0, point.line.0);
@@ -1560,7 +1621,7 @@ impl State {
                 text.push(grid[p].c);
             }
         }
-        links::url_at(&text, col?)
+        Some((text, col?))
     }
 
     fn reset_blink(&mut self) {
@@ -1892,6 +1953,7 @@ impl ApplicationHandler<UserEvent> for App {
             ui_hits: vec![],
             links: vec![],
             pointer: false,
+            preview: None,
             diff: None,
             ctx_tx: {
                 let proxy = self.proxy.clone();
@@ -1914,6 +1976,14 @@ impl ApplicationHandler<UserEvent> for App {
         let Some(st) = self.state.as_mut() else { return };
         let (id, event) = match event {
             UserEvent::Term(id, event) => (id, event),
+            UserEvent::Preview(path, img) => {
+                if let (Some(p), Some((w, h, rgba))) = (st.preview.as_mut().filter(|p| p.path == path), img) {
+                    p.size = Some((w, h));
+                    st.renderer.set_preview(Some((w, h, &rgba)));
+                    st.window.request_redraw();
+                }
+                return;
+            }
             UserEvent::Usage(range, summary) => {
                 if range == st.usage_range {
                     st.usage = Some(summary);
@@ -2325,6 +2395,7 @@ impl ApplicationHandler<UserEvent> for App {
                 st.window.request_redraw();
             }
             WindowEvent::CursorLeft { .. } => {
+                st.hover_image(None);
                 if st.hovered_tab.take().is_some() {
                     st.window.request_redraw();
                 }
@@ -2357,7 +2428,7 @@ impl ApplicationHandler<UserEvent> for App {
                     st.ui_hits.clear();
                     let mut chrome = vec![];
                     st.usage_chrome(&mut chrome);
-                    st.renderer.render(&[], &chrome, &mut st.fonts, GUTTER);
+                    st.renderer.render(&[], &chrome, &mut st.fonts, GUTTER, None);
                     return;
                 }
                 let chrome = st.chrome();
@@ -2387,7 +2458,8 @@ impl ApplicationHandler<UserEvent> for App {
                     })
                     .collect();
                 let refs: Vec<(&Frame, (f32, f32))> = frames.iter().map(|(f, o)| (f, *o)).collect();
-                if st.renderer.render(&refs, &chrome, &mut st.fonts, GUTTER) || st.animating {
+                let preview = st.preview_rect();
+                if st.renderer.render(&refs, &chrome, &mut st.fonts, GUTTER, preview) || st.animating {
                     st.window.request_redraw();
                 }
             }
@@ -2491,6 +2563,17 @@ fn spark(out: &mut Vec<Chrome>, series: &[f64], r: Rect, color: Rgb, s: f32) {
         }
     }
 }
+
+struct Preview {
+    path: PathBuf,
+    /// Mouse position when the hover started; the preview stays there.
+    anchor: (f32, f32),
+    /// Pixel size once decoded and uploaded.
+    size: Option<(u32, u32)>,
+}
+
+/// Largest preview side, in points.
+const PREVIEW_MAX: f32 = 320.0;
 
 /// One positioned word of the panel's Markdown.
 struct MdWord {

@@ -23,6 +23,8 @@ pub enum UserEvent {
     Context(crate::context::Update),
     Usage(crate::usage::Range, Box<crate::usage::Summary>),
     Diff(std::path::PathBuf, Box<crate::diff::Diff>),
+    /// A decoded image preview (`w`, `h`, RGBA), or `None` when it could not be read.
+    Preview(std::path::PathBuf, Option<(u32, u32, Vec<u8>)>),
 }
 
 #[derive(Clone)]

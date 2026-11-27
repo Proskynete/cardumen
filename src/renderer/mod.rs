@@ -130,6 +130,11 @@ pub struct Renderer {
     atlas: Atlas,
     quads: Vec<Quad>,
     atlas_reset: bool,
+    /// Kept to build the image preview's bind group on demand.
+    layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+    /// Image preview texture, alive only while a preview is shown.
+    preview: Option<wgpu::BindGroup>,
 }
 
 fn solid(x: f32, y: f32, w: f32, h: f32, c: Rgb) -> Quad {
@@ -293,7 +298,43 @@ impl Renderer {
             atlas: Atlas::default(),
             quads: Vec::new(),
             atlas_reset: false,
+            layout,
+            sampler,
+            preview: None,
         }
+    }
+
+    /// Upload an RGBA image (`w × h`, already at display size) for the preview, or drop it.
+    pub fn set_preview(&mut self, image: Option<(u32, u32, &[u8])>) {
+        self.preview = image.map(|(w, h, rgba)| {
+            let size = wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 };
+            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("image preview"),
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            self.queue.write_texture(
+                texture.as_image_copy(),
+                rgba,
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4 * w), rows_per_image: Some(h) },
+                size,
+            );
+            let view = texture.create_view(&Default::default());
+            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &self.layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: self.uniforms.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&view) },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                ],
+            })
+        });
     }
 
     fn instance_buffer(device: &wgpu::Device, quads: usize) -> wgpu::Buffer {
@@ -444,7 +485,15 @@ impl Renderer {
 
     /// Draw chrome (behind) and every pane frame. Returns true when another frame
     /// is needed (the atlas was reset mid-frame).
-    pub fn render(&mut self, frames: &[(&Frame, (f32, f32))], chrome: &[Chrome], fonts: &mut Fonts, clear: Rgb) -> bool {
+    /// `preview` is where the uploaded image preview goes, on top of everything.
+    pub fn render(
+        &mut self,
+        frames: &[(&Frame, (f32, f32))],
+        chrome: &[Chrome],
+        fonts: &mut Fonts,
+        clear: Rgb,
+        preview: Option<crate::layout::Rect>,
+    ) -> bool {
         self.atlas_reset = false;
         self.quads.clear();
         for item in chrome {
@@ -465,6 +514,15 @@ impl Renderer {
         }
         for (frame, pad) in frames {
             self.push_frame(frame, fonts, *pad);
+        }
+        let preview = preview.filter(|_| self.preview.is_some());
+        if let Some(r) = preview {
+            let b = 6.0;
+            let color = rgba(theme::MUTED);
+            self.quads.push(Quad { pos: [r.x - b, r.y - b], size: [r.w + 2.0 * b, r.h + 2.0 * b], uv: [b + 2.0, 0.0, 0.0, 0.0], color, kind: ROUND, _pad: [0; 3] });
+            // uv is divided by the atlas size in the shader: SIZE × SIZE spans the whole preview texture.
+            let full = atlas::SIZE as f32;
+            self.quads.push(Quad { pos: [r.x, r.y], size: [r.w, r.h], uv: [0.0, 0.0, full, full], color: [1.0; 4], kind: COLOR, _pad: [0; 3] });
         }
         let screen = [self.config.width as f32, self.config.height as f32, atlas::SIZE as f32, atlas::SIZE as f32];
         self.queue.write_buffer(&self.uniforms, 0, bytemuck::cast_slice(&screen));
@@ -498,7 +556,15 @@ impl Renderer {
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.set_vertex_buffer(0, self.instances.slice(..needed.max(1)));
-            pass.draw(0..4, 0..self.quads.len() as u32);
+            let n = self.quads.len() as u32;
+            match (&self.preview, preview) {
+                (Some(bind), Some(_)) => {
+                    pass.draw(0..4, 0..n - 1);
+                    pass.set_bind_group(0, bind, &[]);
+                    pass.draw(0..4, n - 1..n);
+                }
+                _ => pass.draw(0..4, 0..n),
+            }
         }
         self.queue.submit([encoder.finish()]);
         self.queue.present(output);
