@@ -459,7 +459,7 @@ impl Renderer {
         let mut run = fonts.run(text, face, px, bold);
         if run.width > max_w {
             // Binary search the longest prefix that fits with an ellipsis.
-            let chars: Vec<char> = text.chars().collect();
+            let chars: Vec<char> = crate::font::clip(text).chars().collect();
             let (mut lo, mut hi) = (0, chars.len());
             while lo < hi {
                 let mid = (lo + hi).div_ceil(2);
