@@ -31,7 +31,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::platform::macos::{OptionAsAlt, WindowAttributesExtMacOS};
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
-use winit::window::{Window, WindowId};
+use winit::window::{CursorIcon, Window, WindowId};
 
 use config::Config;
 use font::Fonts;
@@ -170,6 +170,8 @@ struct State {
     ui_hits: Vec<(Rect, UiHit)>,
     /// URLs behind `UiHit::Link`, rebuilt with the hit-boxes every frame.
     links: Vec<String>,
+    /// Hand cursor shown: the mouse is over a clickable link.
+    pointer: bool,
     diff: Option<DiffView>,
     ctx_tx: std::sync::mpsc::Sender<context::Request>,
     /// Last seen structure (without directories) and when to save it.
@@ -1511,6 +1513,20 @@ impl State {
         (Point::new(Line(line as i32 - offset), Column(col)), side, col, line)
     }
 
+    /// Hand cursor over panel links, and over terminal URLs while Cmd is held.
+    fn update_pointer(&mut self) {
+        let (x, y) = (self.mouse.x as f32, self.mouse.y as f32);
+        let over_link = self.ui_hits.iter().any(|(r, h)| matches!(h, UiHit::Link(_)) && r.contains(x, y))
+            || (self.mods.super_key()
+                && self.diff.is_none()
+                && !self.usage_open
+                && self.pane_at(x, y).is_some_and(|id| self.url_at(id).is_some()));
+        if over_link != self.pointer {
+            self.pointer = over_link;
+            self.window.set_cursor(if over_link { CursorIcon::Pointer } else { CursorIcon::Default });
+        }
+    }
+
     /// The web URL under the mouse in pane `id`: an OSC 8 hyperlink, or one
     /// found in the text of the (soft-wrapped) line.
     fn url_at(&self, id: PaneId) -> Option<String> {
@@ -1875,6 +1891,7 @@ impl ApplicationHandler<UserEvent> for App {
             footer_hover: false,
             ui_hits: vec![],
             links: vec![],
+            pointer: false,
             diff: None,
             ctx_tx: {
                 let proxy = self.proxy.clone();
@@ -2009,7 +2026,10 @@ impl ApplicationHandler<UserEvent> for App {
                 let points = st.font_points;
                 st.set_font_size(points);
             }
-            WindowEvent::ModifiersChanged(m) => st.mods = m.state(),
+            WindowEvent::ModifiersChanged(m) => {
+                st.mods = m.state();
+                st.update_pointer();
+            }
             WindowEvent::Focused(focused) => {
                 st.window_focused = focused;
                 let session = &st.focused().session;
@@ -2104,6 +2124,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 st.mouse = position;
+                st.update_pointer();
                 let (x, y, s) = (position.x as f32, position.y as f32, st.scale());
                 let hovered = st.tab_hits.iter().find_map(|(r, h)| match h {
                     TabHit::Tab(i) | TabHit::Close(i) if r.contains(x, y) => Some(*i),
