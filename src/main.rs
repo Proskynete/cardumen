@@ -24,10 +24,10 @@ use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::TermMode;
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition};
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
-use winit::platform::macos::WindowAttributesExtMacOS;
+use winit::platform::macos::{OptionAsAlt, WindowAttributesExtMacOS};
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 use winit::window::{Window, WindowId};
 
@@ -143,6 +143,8 @@ struct State {
     pressed_button: Option<(PaneId, u8)>,
     /// Tab being renamed and its edit buffer.
     renaming: Option<(usize, String)>,
+    /// IME composition in progress (dead key pending), drawn at the cursor.
+    preedit: String,
     last_tab_click: Option<(Instant, usize)>,
     dragging_tab: Option<TabDrag>,
     /// Drawn x of each tab (by tab id), eased towards its slot every frame.
@@ -1699,8 +1701,12 @@ impl ApplicationHandler<UserEvent> for App {
             .with_inner_size(LogicalSize::new(1320.0, 820.0))
             .with_titlebar_transparent(true)
             .with_fullsize_content_view(true)
-            .with_title_hidden(true);
+            .with_title_hidden(true)
+            // Option is Meta (see input::encode); keeps Option dead keys out of the IME.
+            .with_option_as_alt(OptionAsAlt::Both);
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
+        // Without IME, macOS dead keys (´ + e) never compose into é.
+        window.set_ime_allowed(true);
         let fonts = Fonts::new(&self.config.font.family, self.config.font.size, window.scale_factor() as f32);
         let renderer = Renderer::new(window.clone());
         let mut st = State {
@@ -1725,6 +1731,7 @@ impl ApplicationHandler<UserEvent> for App {
             scroll_px: 0.0,
             pressed_button: None,
             renaming: None,
+            preedit: String::new(),
             last_tab_click: None,
             dragging_tab: None,
             tab_x: HashMap::new(),
@@ -1885,6 +1892,29 @@ impl ApplicationHandler<UserEvent> for App {
                     session.write(if focused { &b"\x1b[I"[..] } else { &b"\x1b[O"[..] });
                 }
                 st.reset_blink();
+                st.window.request_redraw();
+            }
+            WindowEvent::Ime(Ime::Preedit(text, _)) => {
+                st.preedit = text;
+                st.window.request_redraw();
+            }
+            WindowEvent::Ime(Ime::Disabled) => {
+                st.preedit.clear();
+                st.window.request_redraw();
+            }
+            WindowEvent::Ime(Ime::Commit(text)) => {
+                st.preedit.clear();
+                if let Some((_, buf)) = st.renaming.as_mut() {
+                    buf.extend(text.chars().filter(|c| !c.is_control()));
+                } else if st.diff.is_none() && !st.usage_open {
+                    let session = &st.panes[&st.focused_id()].session;
+                    session.write(text.into_bytes());
+                    let mut term = session.term.lock();
+                    term.scroll_display(Scroll::Bottom);
+                    term.selection = None;
+                    drop(term);
+                    st.reset_blink();
+                }
                 st.window.request_redraw();
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
@@ -2177,8 +2207,20 @@ impl ApplicationHandler<UserEvent> for App {
                         let pane = st.panes.get(id)?;
                         let is_focused = *id == focused;
                         let term = pane.session.term.lock();
-                        let frame = Frame::capture(&term, st.window_focused && is_focused, !is_focused || st.cursor_on);
-                        Some((frame, st.grid_origin(*rect)))
+                        let mut frame = Frame::capture(&term, st.window_focused && is_focused, !is_focused || st.cursor_on);
+                        let origin = st.grid_origin(*rect);
+                        if is_focused && st.renaming.is_none() {
+                            if !st.preedit.is_empty() {
+                                frame.overlay_preedit(&st.preedit);
+                            }
+                            // Lets macOS place the accent popup next to the cursor.
+                            if let Some(c) = &frame.cursor {
+                                let (cw, ch) = (st.fonts.cell_w, st.fonts.cell_h);
+                                let pos = PhysicalPosition::new(origin.0 + c.col as f32 * cw, origin.1 + c.line as f32 * ch);
+                                st.window.set_ime_cursor_area(pos, winit::dpi::PhysicalSize::new(cw, ch));
+                            }
+                        }
+                        Some((frame, origin))
                     })
                     .collect();
                 let refs: Vec<(&Frame, (f32, f32))> = frames.iter().map(|(f, o)| (f, *o)).collect();

@@ -109,6 +109,8 @@ fn encode_named(key: NamedKey, mods: ModifiersState, app_cursor: bool) -> Option
         NamedKey::F10 => tilde(21),
         NamedKey::F11 => tilde(23),
         NamedKey::F12 => tilde(24),
+        // Shift+Enter as Meta-Enter: newline in Claude Code's prompt and zsh (self-insert-unmeta).
+        NamedKey::Enter if mods.shift_key() => b"\x1b\r".to_vec(),
         NamedKey::Enter => alt(b"\r"),
         NamedKey::Tab if mods.shift_key() => b"\x1b[Z".to_vec(),
         NamedKey::Tab => alt(b"\t"),
@@ -187,6 +189,7 @@ mod tests {
     #[test]
     fn misc_keys() {
         assert_eq!(named(NamedKey::Enter, ModifiersState::empty(), false), b"\r");
+        assert_eq!(named(NamedKey::Enter, ModifiersState::SHIFT, false), b"\x1b\r");
         assert_eq!(named(NamedKey::Backspace, ModifiersState::empty(), false), [0x7f]);
         assert_eq!(named(NamedKey::Tab, ModifiersState::SHIFT, false), b"\x1b[Z");
         assert_eq!(named(NamedKey::Delete, ModifiersState::CONTROL, false), b"\x1b[3;5~");
