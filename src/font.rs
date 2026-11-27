@@ -23,6 +23,16 @@ pub enum Face {
     Mono,
 }
 
+/// Longest interface text shaped: wider than any window at any font size.
+/// Bounds the run cache (4096 entries) by size too: unclipped, one minified
+/// diff line or a huge title made multi-MB entries and grew it to 20 GB.
+pub const MAX_RUN_CHARS: usize = 512;
+
+/// `text` cut to its first `MAX_RUN_CHARS` chars.
+pub fn clip(text: &str) -> &str {
+    text.char_indices().nth(MAX_RUN_CHARS).map_or(text, |(i, _)| &text[..i])
+}
+
 /// A shaped single-line text run: glyph cache keys with positions relative to the
 /// run's top-left (y already includes the baseline), and its width in pixels.
 #[derive(Clone)]
@@ -118,6 +128,7 @@ impl Fonts {
 
     /// Shape one line of interface text (cached).
     pub fn run(&mut self, text: &str, face: Face, px: f32, bold: bool) -> Run {
+        let text = clip(text);
         let key = (text.to_string(), face, px.to_bits(), bold);
         if let Some(run) = self.runs.get(&key) {
             return run.clone();
@@ -163,5 +174,29 @@ impl Fonts {
             color,
             rgba,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clip_counts_chars() {
+        assert_eq!(clip("añadí"), "añadí");
+        let long = "é".repeat(MAX_RUN_CHARS + 10);
+        assert_eq!(clip(&long).chars().count(), MAX_RUN_CHARS);
+    }
+
+    #[test]
+    fn huge_text_stays_small_in_cache() {
+        // Regression: a 200k-char label cached a multi-MB run per probe.
+        let mut f = Fonts::new("Menlo", 13.0, 2.0);
+        let huge = "x".repeat(200_000);
+        let started = std::time::Instant::now();
+        let run = f.run(&huge, Face::Mono, 13.0, false);
+        assert!(run.glyphs.len() <= MAX_RUN_CHARS);
+        assert!(f.runs.keys().all(|(t, ..)| t.chars().count() <= MAX_RUN_CHARS));
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 }
