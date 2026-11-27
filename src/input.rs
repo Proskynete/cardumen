@@ -20,8 +20,9 @@ fn ctrl_byte(c: char) -> Option<u8> {
     }
 }
 
-/// `key` is the logical key; `plain` is the same key without modifiers applied
-/// (on macOS, Option turns `b` into `∫`, and we want Meta-b instead).
+/// `key` is the logical key; `plain` is the same key without modifiers applied.
+/// Option+character types what the layout gives (`@` is Option+2 on Spanish
+/// layouts); only Option with named keys (arrows, Backspace, Enter) is Meta.
 pub fn encode(key: &Key, plain: &Key, text: Option<&str>, mods: ModifiersState, app_cursor: bool) -> Option<Vec<u8>> {
     let esc = |mut v: Vec<u8>| {
         if mods.alt_key() {
@@ -39,13 +40,6 @@ pub fn encode(key: &Key, plain: &Key, text: Option<&str>, mods: ModifiersState, 
             }?;
             ctrl_byte(c).map(|b| esc(vec![b]))
         }
-        Key::Character(s) if mods.alt_key() => match plain {
-            Key::Character(p) => {
-                let p = if mods.shift_key() { p.to_uppercase() } else { p.to_string() };
-                Some(esc(p.into_bytes()))
-            }
-            _ => Some(s.as_bytes().to_vec()),
-        },
         _ => text.map(|t| t.as_bytes().to_vec()),
     }
 }
@@ -185,8 +179,9 @@ mod tests {
     }
 
     #[test]
-    fn option_is_meta() {
-        assert_eq!(encode(&ch("∫"), &ch("b"), Some("∫"), ModifiersState::ALT, false).unwrap(), b"\x1bb");
+    fn option_types_layout_chars() {
+        assert_eq!(encode(&ch("@"), &ch("2"), Some("@"), ModifiersState::ALT, false).unwrap(), b"@");
+        assert_eq!(encode(&ch("c"), &ch("c"), None, ModifiersState::ALT | ModifiersState::CONTROL, false).unwrap(), b"\x1b\x03");
     }
 
     #[test]
