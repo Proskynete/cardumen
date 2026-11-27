@@ -1,6 +1,7 @@
 //! Just enough Markdown for Claude's last message in the side panel:
-//! headings, bullets, quotes, fenced code, **bold**, `code` and [links](url).
-//! shortcut: no italics, tables or nesting; add them if Claude's summaries need them.
+//! headings, bullets, quotes, fenced code, tables, **bold**, `code` and [links](url).
+//! shortcut: no italics or nesting, and table rows are flattened to "a · b · c" (no
+//! column alignment: the panel is narrow and proportional); add them if summaries need them.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Style {
@@ -40,9 +41,18 @@ pub fn parse(md: &str) -> Vec<Line> {
         }
         let hashes = t.chars().take_while(|&c| c == '#').count();
         let line = if (1..=6).contains(&hashes) && t[hashes..].starts_with(' ') {
-            let spans = inline(t[hashes..].trim());
-            let bold = |s: Span| Span { style: if s.style == Style::Plain { Style::Bold } else { s.style }, ..s };
-            Line { prefix: "", spans: spans.into_iter().map(bold).collect() }
+            Line { prefix: "", spans: inline(t[hashes..].trim()).into_iter().map(bold).collect() }
+        } else if let Some(row) = t.strip_prefix('|') {
+            if row.chars().all(|c| matches!(c, '|' | '-' | ':' | ' ')) {
+                // `|---|---|` marks the row above as the header.
+                if let Some(head) = out.last_mut() {
+                    head.spans = std::mem::take(&mut head.spans).into_iter().map(bold).collect();
+                }
+                continue;
+            }
+            let row = row.trim_end();
+            let cells: Vec<&str> = row.strip_suffix('|').unwrap_or(row).split('|').map(str::trim).filter(|c| !c.is_empty()).collect();
+            Line { prefix: "", spans: inline(&cells.join(" · ")) }
         } else if let Some(rest) = ["- ", "* ", "+ "].iter().find_map(|m| t.strip_prefix(m)) {
             Line { prefix: "• ", spans: inline(rest) }
         } else if let Some(rest) = t.strip_prefix('>') {
@@ -55,6 +65,11 @@ pub fn parse(md: &str) -> Vec<Line> {
         out.push(line);
     }
     out
+}
+
+/// Plain text turns bold; code and links keep their style.
+fn bold(s: Span) -> Span {
+    Span { style: if s.style == Style::Plain { Style::Bold } else { s.style }, ..s }
 }
 
 fn inline(s: &str) -> Vec<Span> {
@@ -151,6 +166,19 @@ mod tests {
                 ("│ ", vec![("nota", Style::Plain)]),
                 ("", vec![("let x = 1;", Style::Code)]),
                 ("", vec![("fin", Style::Plain)]),
+            ]
+        );
+    }
+
+    #[test]
+    fn tables() {
+        let lines = parse("| | Antes | Ahora |\n|---|---|---|\n| Tarifa | $13.000 | **$15.000** |");
+        let flat: Vec<Vec<(&str, Style)>> = lines.iter().map(|l| l.spans.iter().map(|s| (s.text.as_str(), s.style)).collect()).collect();
+        assert_eq!(
+            flat,
+            vec![
+                vec![("Antes · Ahora", Style::Bold)],
+                vec![("Tarifa · $13.000 · ", Style::Plain), ("$15.000", Style::Bold)],
             ]
         );
     }
