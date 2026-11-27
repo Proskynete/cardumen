@@ -386,6 +386,8 @@ pub enum Request {
     Panes(Vec<(PaneId, u32)>),
     /// Recompute git data for this pane's repo now (a Claude turn ended).
     Refresh(PaneId),
+    /// Panes on screen (the active tab); only these are polled.
+    Visible(Vec<PaneId>),
     /// Read Claude's last message from this transcript.
     Transcript(PaneId, PathBuf),
 }
@@ -396,6 +398,8 @@ pub enum Update {
 }
 
 struct RepoState {
+    /// Panes that already received the current `ctx`.
+    sent: Vec<PaneId>,
     git_at: Option<Instant>,
     pr_at: Option<(Instant, Option<String>)>,
     ctx: Option<Context>,
@@ -418,10 +422,12 @@ fn worker(rx: Receiver<Request>, send: impl Fn(Update) -> bool, cwd_of: fn(u32) 
     let mut panes: Vec<(PaneId, u32)> = vec![];
     let mut repos: HashMap<PathBuf, RepoState> = HashMap::new();
     let mut urgent: Vec<PaneId> = vec![];
+    let mut visible: Vec<PaneId> = vec![];
     loop {
         match rx.recv_timeout(Duration::from_secs(1)) {
             Ok(Request::Panes(p)) => panes = p,
             Ok(Request::Refresh(id)) => urgent.push(id),
+            Ok(Request::Visible(v)) => visible = v,
             Ok(Request::Transcript(id, path)) => {
                 if let Some(text) = last_assistant_text(&path) {
                     if !send(Update::LastMessage(id, text)) {
@@ -432,16 +438,28 @@ fn worker(rx: Receiver<Request>, send: impl Fn(Update) -> bool, cwd_of: fn(u32) 
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(_) => return,
         }
-        // Group panes by repository; panes outside git get nothing.
+        // Group on-screen (or just-finished) panes by repository; panes outside
+        // git get nothing. Hidden panes keep their last context until shown.
         let mut by_repo: HashMap<PathBuf, Vec<PaneId>> = HashMap::new();
-        for &(id, pid) in &panes {
+        for &(id, pid) in panes.iter().filter(|(id, _)| visible.contains(id) || urgent.contains(id)) {
             if let Some(root) = cwd_of(pid).as_deref().and_then(repo_root) {
                 by_repo.entry(root).or_default().push(id);
             }
         }
-        repos.retain(|r, _| by_repo.contains_key(r));
+        // Repos of hidden panes keep their state, so showing them again does not
+        // refetch the PR at once. shortcut: one entry per repo seen this session.
         for (repo, ids) in by_repo {
-            let st = repos.entry(repo.clone()).or_insert(RepoState { git_at: None, pr_at: None, ctx: None });
+            let st = repos.entry(repo.clone()).or_insert(RepoState { sent: vec![], git_at: None, pr_at: None, ctx: None });
+            // A pane shown again gets the cached context right away.
+            if let Some(ctx) = &st.ctx {
+                let new: Vec<PaneId> = ids.iter().copied().filter(|id| !st.sent.contains(id)).collect();
+                for id in new {
+                    if !send(Update::Context(id, Box::new(ctx.clone()))) {
+                        return;
+                    }
+                    st.sent.push(id);
+                }
+            }
             let forced = ids.iter().any(|id| urgent.contains(id));
             let git_due = forced || st.git_at.is_none_or(|t| t.elapsed() >= GIT_EVERY);
             let branch_now = branch(&repo);
@@ -470,10 +488,12 @@ fn worker(rx: Receiver<Request>, send: impl Fn(Update) -> bool, cwd_of: fn(u32) 
             st.git_at = Some(Instant::now());
             if st.ctx.as_ref() != Some(&ctx) {
                 st.ctx = Some(ctx.clone());
+                st.sent.clear();
                 for id in &ids {
                     if !send(Update::Context(*id, Box::new(ctx.clone()))) {
                         return;
                     }
+                    st.sent.push(*id);
                 }
             }
         }
@@ -516,6 +536,31 @@ mod tests {
         assert_eq!(tool_path(Some("/usr/bin:/bin")), "/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin");
         assert_eq!(tool_path(Some("/opt/homebrew/bin:/usr/bin")), "/opt/homebrew/bin:/usr/bin:/usr/local/bin");
         assert_eq!(tool_path(None), "/opt/homebrew/bin:/usr/local/bin");
+    }
+
+    #[test]
+    fn polls_only_visible_panes() {
+        static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        let root = ROOT.get_or_init(|| std::env::temp_dir().join(format!("cardumen-visible-{}", std::process::id())));
+        std::fs::create_dir_all(root).unwrap();
+        assert!(Command::new("git").args(["init", "-q"]).current_dir(root).status().unwrap().success());
+        fn cwd(_: u32) -> Option<PathBuf> {
+            ROOT.get().cloned()
+        }
+        let (out_tx, out) = channel();
+        let tx = spawn(move |u| out_tx.send(u).is_ok(), cwd);
+        let next = || match out.recv_timeout(Duration::from_secs(5)) {
+            Ok(Update::Context(id, _)) => Some(id),
+            _ => None,
+        };
+        tx.send(Request::Panes(vec![(1, 0), (2, 0)])).unwrap();
+        tx.send(Request::Visible(vec![1])).unwrap();
+        assert_eq!(next(), Some(1));
+        // Pane 2 (same repo) is hidden: nothing for it until it is shown.
+        assert_eq!(out.recv_timeout(Duration::from_millis(1500)).ok().map(|_| ()), None);
+        tx.send(Request::Visible(vec![2])).unwrap();
+        assert_eq!(next(), Some(2));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -23,7 +23,8 @@ fn ctrl_byte(c: char) -> Option<u8> {
 /// `key` is the logical key; `plain` is the same key without modifiers applied.
 /// Option+character types what the layout gives (`@` is Option+2 on Spanish
 /// layouts); only Option with named keys (arrows, Backspace, Enter) is Meta.
-pub fn encode(key: &Key, plain: &Key, text: Option<&str>, mods: ModifiersState, app_cursor: bool) -> Option<Vec<u8>> {
+/// `meta`: this Option is the one configured as Meta (right Option).
+pub fn encode(key: &Key, plain: &Key, text: Option<&str>, mods: ModifiersState, app_cursor: bool, meta: bool) -> Option<Vec<u8>> {
     let esc = |mut v: Vec<u8>| {
         if mods.alt_key() {
             v.insert(0, 0x1b);
@@ -40,6 +41,10 @@ pub fn encode(key: &Key, plain: &Key, text: Option<&str>, mods: ModifiersState, 
             }?;
             ctrl_byte(c).map(|b| esc(vec![b]))
         }
+        Key::Character(_) if meta && mods.alt_key() => match plain {
+            Key::Character(p) => Some(esc(if mods.shift_key() { p.to_uppercase() } else { p.to_string() }.into_bytes())),
+            _ => text.map(|t| t.as_bytes().to_vec()),
+        },
         _ => text.map(|t| t.as_bytes().to_vec()),
     }
 }
@@ -165,23 +170,30 @@ mod tests {
     }
 
     fn named(k: NamedKey, mods: ModifiersState, app: bool) -> Vec<u8> {
-        encode(&Key::Named(k), &Key::Named(k), None, mods, app).unwrap()
+        encode(&Key::Named(k), &Key::Named(k), None, mods, app, false).unwrap()
     }
 
     #[test]
     fn plain_text() {
-        assert_eq!(encode(&ch("a"), &ch("a"), Some("a"), ModifiersState::empty(), false).unwrap(), b"a");
+        assert_eq!(encode(&ch("a"), &ch("a"), Some("a"), ModifiersState::empty(), false, false).unwrap(), b"a");
     }
 
     #[test]
     fn ctrl_c_is_etx() {
-        assert_eq!(encode(&ch("c"), &ch("c"), None, ModifiersState::CONTROL, false).unwrap(), [3]);
+        assert_eq!(encode(&ch("c"), &ch("c"), None, ModifiersState::CONTROL, false, false).unwrap(), [3]);
     }
 
     #[test]
     fn option_types_layout_chars() {
-        assert_eq!(encode(&ch("@"), &ch("2"), Some("@"), ModifiersState::ALT, false).unwrap(), b"@");
-        assert_eq!(encode(&ch("c"), &ch("c"), None, ModifiersState::ALT | ModifiersState::CONTROL, false).unwrap(), b"\x1b\x03");
+        assert_eq!(encode(&ch("@"), &ch("2"), Some("@"), ModifiersState::ALT, false, false).unwrap(), b"@");
+        assert_eq!(encode(&ch("c"), &ch("c"), None, ModifiersState::ALT | ModifiersState::CONTROL, false, false).unwrap(), b"\x1b\x03");
+    }
+
+    #[test]
+    fn right_option_is_meta() {
+        // With OptionAsAlt::OnlyRight winit reports the plain key for right Option.
+        assert_eq!(encode(&ch("b"), &ch("b"), Some("b"), ModifiersState::ALT, false, true).unwrap(), b"\x1bb");
+        assert_eq!(encode(&ch("B"), &ch("b"), Some("B"), ModifiersState::ALT | ModifiersState::SHIFT, false, true).unwrap(), b"\x1bB");
     }
 
     #[test]
