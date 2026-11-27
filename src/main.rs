@@ -182,6 +182,8 @@ struct State {
     right_alt: bool,
     /// Find bar (Cmd+F) of a pane.
     search: Option<search::Search>,
+    /// Multi-line paste waiting for Enter, since the app did not enable bracketed paste: (pane, text, lines).
+    pending_paste: Option<(PaneId, String, usize)>,
     /// Number shown on the Dock icon.
     badge: usize,
     diff: Option<DiffView>,
@@ -364,6 +366,9 @@ impl State {
         self.renaming = None;
         if self.search.as_ref().is_some_and(|s| s.pane == id) {
             self.search = None;
+        }
+        if self.pending_paste.as_ref().is_some_and(|p| p.0 == id) {
+            self.pending_paste = None;
         }
         // A drag that started in this pane must not index it after it is gone.
         if self.selecting == Some(id) {
@@ -1503,6 +1508,15 @@ impl State {
             let close_w = 22.0 * s;
             let mut x = r.x + 12.0 * s;
             let mut max = r.x + r.w - close_w - 8.0 * s;
+            // Paste confirmation, in the same spot as the find bar.
+            if let Some((_, _, n)) = self.pending_paste.as_ref().filter(|p| p.0 == id) {
+                let text = format!("Pegar {n} {} sin protección · Enter pega · Esc cancela", if *n == 1 { "línea" } else { "líneas" });
+                let bw = (self.fonts.run(&text, Face::Sans, px, false).width + 16.0 * s).min(max - x);
+                let (bx, by, bh) = (max - bw, r.y + 4.0 * s, HEADER_H * s - 8.0 * s);
+                out.push(Chrome::Round { rect: Rect { x: bx, y: by, w: bw, h: bh }, radius: 6.0 * s, color: mix(WARM, CARD, 0.16) });
+                out.push(label(bx + 8.0 * s, hy, text, Face::Sans, px, false, WARM, bw - 16.0 * s));
+                max = bx - 8.0 * s;
+            }
             // Find bar in the header, right-aligned, where no cells are drawn.
             if let Some(q) = self.search.as_ref().filter(|q| q.pane == id) {
                 let bw = (260.0 * s).min(max - x);
@@ -1739,8 +1753,20 @@ impl State {
     }
 
     fn paste_text(&mut self, text: &str) {
-        let session = &self.panes[&self.focused_id()].session;
-        let bracketed = session.term.lock().mode().contains(TermMode::BRACKETED_PASTE);
+        let id = self.focused_id();
+        let bracketed = self.panes[&id].session.term.lock().mode().contains(TermMode::BRACKETED_PASTE);
+        if let Some(lines) = input::unprotected_lines(text, bracketed) {
+            // Each line break would run a command at once: ask first.
+            self.pending_paste = Some((id, text.to_string(), lines));
+            self.window.request_redraw();
+            return;
+        }
+        self.send_paste(id, text, bracketed);
+    }
+
+    fn send_paste(&mut self, id: PaneId, text: &str, bracketed: bool) {
+        let Some(pane) = self.panes.get(&id) else { return };
+        let session = &pane.session;
         let bytes = if bracketed {
             // Strip any end marker inside the text so it cannot break out of the paste.
             format!("\x1b[200~{}\x1b[201~", text.replace("\x1b[201~", ""))
@@ -2020,6 +2046,7 @@ impl ApplicationHandler<UserEvent> for App {
             preview: None,
             right_alt: false,
             search: None,
+            pending_paste: None,
             badge: 0,
             diff: None,
             ctx_tx: {
@@ -2130,10 +2157,9 @@ impl ApplicationHandler<UserEvent> for App {
                     let _ = cb.set_text(text);
                 }
             }
-            Event::ClipboardLoad(_, format) => {
-                let text = st.clipboard.as_mut().and_then(|cb| cb.get_text().ok()).unwrap_or_default();
-                st.panes[&id].session.write(format(&text).into_bytes());
-            }
+            // OSC 52 reads are ignored, with no reply: any program's output (a `cat`,
+            // a log) could otherwise read the clipboard and send it away.
+            Event::ClipboardLoad(..) => {}
             Event::ColorRequest(index, format) => {
                 let rgb = match index {
                     256 => theme::FOREGROUND,
@@ -2203,7 +2229,7 @@ impl ApplicationHandler<UserEvent> for App {
                 } else if let Some(s) = st.search.as_mut() {
                     s.query.extend(text.chars().filter(|c| !c.is_control()));
                     st.search_step(Direction::Left, false);
-                } else if st.diff.is_none() && !st.usage_open {
+                } else if st.diff.is_none() && !st.usage_open && st.pending_paste.is_none() {
                     let session = &st.panes[&st.focused_id()].session;
                     session.write(text.into_bytes());
                     let mut term = session.term.lock();
@@ -2239,6 +2265,20 @@ impl ApplicationHandler<UserEvent> for App {
                             st.window.request_redraw();
                         }
                     }
+                    return;
+                }
+                if let Some((id, text, _)) = st.pending_paste.as_ref() {
+                    match &event.logical_key {
+                        Key::Named(NamedKey::Enter) => {
+                            let (id, text) = (*id, text.clone());
+                            st.pending_paste = None;
+                            st.send_paste(id, &text, false);
+                        }
+                        Key::Named(NamedKey::Escape) => st.pending_paste = None,
+                        Key::Character(c) if st.mods.super_key() && c.as_str() == "q" => event_loop.exit(),
+                        _ => {}
+                    }
+                    st.window.request_redraw();
                     return;
                 }
                 if st.search.is_some() {

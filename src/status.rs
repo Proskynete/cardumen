@@ -1,5 +1,6 @@
 //! Claude Code session state, reported by hooks over a Unix socket.
 use std::io::{BufRead, BufReader};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -76,6 +77,8 @@ pub fn listen(path: PathBuf, proxy: EventLoopProxy<UserEvent>) -> std::io::Resul
 fn serve(path: PathBuf, on_event: impl Fn(PaneId, Option<Claude>, Hook) -> bool + Send + 'static) -> std::io::Result<()> {
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path)?;
+    // Owner only; $TMPDIR is already per-user, this is defence in depth.
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     std::thread::Builder::new().name("status socket".into()).spawn(move || {
         for stream in listener.incoming().flatten() {
             for line in BufReader::new(stream).lines().map_while(Result::ok) {
@@ -117,6 +120,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("cardumen-test-{}.sock", std::process::id()));
         let (tx, rx) = std::sync::mpsc::channel();
         serve(path.clone(), move |pane, state, hook| tx.send((pane, state, hook)).is_ok()).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         let hook = r#"[ -n "$CARDUMEN_SOCKET" ] && { printf '%s waiting ' "$CARDUMEN_PANE"; tr -d '\n'; echo; } | nc -U -w 1 "$CARDUMEN_SOCKET" >/dev/null 2>&1; exit 0"#;
         let mut child = std::process::Command::new("sh")
             .args(["-c", hook])
