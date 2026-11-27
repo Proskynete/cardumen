@@ -1,12 +1,14 @@
 mod config;
 mod context;
 mod diff;
+mod dock;
 mod font;
 mod input;
 mod layout;
 mod links;
 mod markdown;
 mod renderer;
+mod search;
 mod session;
 mod session_file;
 mod status;
@@ -21,15 +23,15 @@ use std::time::{Duration, Instant};
 
 use alacritty_terminal::event::{Event, WindowSize};
 use alacritty_terminal::grid::Scroll;
-use alacritty_terminal::index::{Column, Line, Point, Side};
+use alacritty_terminal::index::{Column, Direction, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::TermMode;
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
-use winit::platform::macos::WindowAttributesExtMacOS;
+use winit::keyboard::{Key, KeyCode, ModifiersKeyState, ModifiersState, NamedKey, PhysicalKey};
+use winit::platform::macos::{OptionAsAlt, WindowAttributesExtMacOS};
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 use winit::window::{CursorIcon, Window, WindowId};
 
@@ -87,6 +89,8 @@ struct Pane {
     /// What Claude asked permission for, while waiting.
     ask: Option<String>,
     last_message: Option<String>,
+    /// The user looked at this pane since Claude last finished or asked.
+    seen: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -174,6 +178,12 @@ struct State {
     pointer: bool,
     /// Image under the mouse while Cmd is held.
     preview: Option<Preview>,
+    /// Right Option is held (it is Meta when `right_option_meta` is set).
+    right_alt: bool,
+    /// Find bar (Cmd+F) of a pane.
+    search: Option<search::Search>,
+    /// Number shown on the Dock icon.
+    badge: usize,
     diff: Option<DiffView>,
     ctx_tx: std::sync::mpsc::Sender<context::Request>,
     /// Last seen structure (without directories) and when to save it.
@@ -305,7 +315,7 @@ impl State {
         ];
         match Session::spawn(size, self.config.scrollback, Listener(self.proxy.clone(), id), banner, cwd, env) {
             Ok(session) => {
-                self.panes.insert(id, Pane { session, title: None, rect, claude: None, ctx: None, ask: None, last_message: None });
+                self.panes.insert(id, Pane { session, title: None, rect, claude: None, ctx: None, ask: None, last_message: None, seen: true });
                 self.sync_panes();
                 true
             }
@@ -352,6 +362,9 @@ impl State {
             return self.tabs.list.is_empty();
         }
         self.renaming = None;
+        if self.search.as_ref().is_some_and(|s| s.pane == id) {
+            self.search = None;
+        }
         // A drag that started in this pane must not index it after it is gone.
         if self.selecting == Some(id) {
             self.selecting = None;
@@ -1430,7 +1443,7 @@ impl State {
             let mut text_x = x + TAB_PAD * s;
             let mut max_w = rect.w - 2.0 * TAB_PAD * s - if show_close { close_w } else { 0.0 };
             let (text, editing) = match &self.renaming {
-                Some((j, buf)) if *j == i => (buf.clone(), true),
+                Some((j, buf)) if *j == i => (format!("{buf}{}", self.preedit), true),
                 _ => (self.tab_title(i), false),
             };
             if !editing && self.tab_waiting(i) {
@@ -1482,7 +1495,25 @@ impl State {
             let hy = r.y + (HEADER_H * s - px * 1.3) / 2.0;
             let close_w = 22.0 * s;
             let mut x = r.x + 12.0 * s;
-            let max = r.x + r.w - close_w - 8.0 * s;
+            let mut max = r.x + r.w - close_w - 8.0 * s;
+            // Find bar in the header, right-aligned, where no cells are drawn.
+            if let Some(q) = self.search.as_ref().filter(|q| q.pane == id) {
+                let bw = (260.0 * s).min(max - x);
+                let (bx, by, bh) = (max - bw, r.y + 4.0 * s, HEADER_H * s - 8.0 * s);
+                out.push(Chrome::Round { rect: Rect { x: bx, y: by, w: bw, h: bh }, radius: 6.0 * s, color: CARD });
+                let (text, color) = if q.query.is_empty() && self.preedit.is_empty() {
+                    ("Buscar…".to_string(), theme::MUTED)
+                } else {
+                    (format!("{}{}", q.query, self.preedit), theme::FOREGROUND)
+                };
+                let note = if q.missing { "sin resultados" } else { "" };
+                let nw = if note.is_empty() { 0.0 } else { self.fonts.run(note, Face::Sans, 11.0 * s, false).width + 10.0 * s };
+                out.push(label(bx + 8.0 * s, hy, text, Face::Sans, px, false, color, bw - 16.0 * s - nw));
+                if !note.is_empty() {
+                    out.push(label(bx + bw - nw, hy + s, note.into(), Face::Sans, 11.0 * s, false, WARM, nw));
+                }
+                max = bx - 8.0 * s;
+            }
             let title = self.pane_label(id);
             let tw = self.fonts.run(&title, Face::Sans, px, true).width.min(max - x);
             out.push(label(x, hy, title, Face::Sans, px, true, theme::FOREGROUND, max - x));
@@ -1529,6 +1560,30 @@ impl State {
             self.pointer = over_link;
             self.window.set_cursor(if over_link { CursorIcon::Pointer } else { CursorIcon::Default });
         }
+    }
+
+    /// Cmd+F: open the find bar on the focused pane, or close it (clearing the match).
+    fn toggle_search(&mut self) {
+        match self.search.take() {
+            Some(s) => {
+                if let Some(p) = self.panes.get(&s.pane) {
+                    p.session.term.lock().selection = None;
+                }
+            }
+            None if self.diff.is_none() && !self.usage_open => self.search = Some(search::Search::new(self.focused_id())),
+            None => {}
+        }
+        self.window.request_redraw();
+    }
+
+    fn search_step(&mut self, dir: Direction, again: bool) {
+        let Some(s) = self.search.as_mut() else { return };
+        let Some(pane) = self.panes.get(&s.pane) else {
+            self.search = None;
+            return;
+        };
+        search::step(&mut pane.session.term.lock(), s, dir, again);
+        self.window.request_redraw();
     }
 
     /// Show, keep or drop the image preview for the path now under the mouse.
@@ -1792,6 +1847,7 @@ impl State {
                 }
             }
             "d" => self.split(if m.shift_key() { Dir::Down } else { Dir::Right }),
+            "f" => self.toggle_search(),
             "r" if m.shift_key() => self.start_rename(self.tabs.active),
             "b" => {
                 self.sidebar = !self.sidebar;
@@ -1904,7 +1960,8 @@ impl ApplicationHandler<UserEvent> for App {
             .with_inner_size(LogicalSize::new(1320.0, 820.0))
             .with_titlebar_transparent(true)
             .with_fullsize_content_view(true)
-            .with_title_hidden(true);
+            .with_title_hidden(true)
+            .with_option_as_alt(if self.config.right_option_meta { OptionAsAlt::OnlyRight } else { OptionAsAlt::None });
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
         // Without IME, macOS dead keys (´ + e) never compose into é.
         window.set_ime_allowed(true);
@@ -1954,6 +2011,9 @@ impl ApplicationHandler<UserEvent> for App {
             links: vec![],
             pointer: false,
             preview: None,
+            right_alt: false,
+            search: None,
+            badge: 0,
             diff: None,
             ctx_tx: {
                 let proxy = self.proxy.clone();
@@ -2030,6 +2090,7 @@ impl ApplicationHandler<UserEvent> for App {
                 let prev = pane.claude.map(|c| c.claude);
                 if prev != claude {
                     pane.claude = claude.map(|claude| status::State { claude, since: Instant::now() });
+                    pane.seen = !matches!(claude, Some(status::Claude::Waiting | status::Claude::Done));
                     if claude == Some(status::Claude::Waiting) && !st.window_focused {
                         st.window.request_user_attention(Some(winit::window::UserAttentionType::Informational));
                     }
@@ -2103,6 +2164,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::ModifiersChanged(m) => {
                 st.mods = m.state();
+                st.right_alt = m.ralt_state() == ModifiersKeyState::Pressed;
                 st.update_pointer();
             }
             WindowEvent::Focused(focused) => {
@@ -2131,6 +2193,9 @@ impl ApplicationHandler<UserEvent> for App {
                 st.preedit.clear();
                 if let Some((_, buf)) = st.renaming.as_mut() {
                     buf.extend(text.chars().filter(|c| !c.is_control()));
+                } else if let Some(s) = st.search.as_mut() {
+                    s.query.extend(text.chars().filter(|c| !c.is_control()));
+                    st.search_step(Direction::Left, false);
                 } else if st.diff.is_none() && !st.usage_open {
                     let session = &st.panes[&st.focused_id()].session;
                     session.write(text.into_bytes());
@@ -2169,6 +2234,34 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     return;
                 }
+                if st.search.is_some() {
+                    let plain = event.key_without_modifiers();
+                    if st.mods.super_key() {
+                        match &plain {
+                            Key::Character(c) if c.as_str() == "f" => st.toggle_search(),
+                            Key::Character(c) if c.as_str() == "v" => {
+                                let text = st.clipboard.as_mut().and_then(|cb| cb.get_text().ok()).unwrap_or_default();
+                                if let Some(s) = st.search.as_mut() {
+                                    s.query.push_str(text.lines().next().unwrap_or(""));
+                                }
+                                st.search_step(Direction::Left, false);
+                            }
+                            Key::Character(c) if c.as_str() == "q" => event_loop.exit(),
+                            _ => {}
+                        }
+                        return;
+                    }
+                    let Some(s) = st.search.as_mut() else { return };
+                    let before = s.query.clone();
+                    match input::edit_line(&mut s.query, &event.logical_key, event.text.as_deref(), st.mods) {
+                        // Enter: older match (up); Shift+Enter: newer.
+                        input::Edit::Commit => st.search_step(if st.mods.shift_key() { Direction::Right } else { Direction::Left }, true),
+                        input::Edit::Cancel => st.toggle_search(),
+                        input::Edit::Continue if s.query != before => st.search_step(Direction::Left, false),
+                        input::Edit::Continue => {}
+                    }
+                    return;
+                }
                 if st.diff.is_some() {
                     let plain = event.key_without_modifiers();
                     if st.mods.super_key() {
@@ -2187,7 +2280,8 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 let session = &st.panes[&st.focused_id()].session;
                 let app_cursor = session.term.lock().mode().contains(TermMode::APP_CURSOR);
-                if let Some(bytes) = input::encode(&event.logical_key, &plain, event.text.as_deref(), st.mods, app_cursor) {
+                let meta = st.config.right_option_meta && st.right_alt;
+                if let Some(bytes) = input::encode(&event.logical_key, &plain, event.text.as_deref(), st.mods, app_cursor, meta) {
                     session.write(bytes);
                     let mut term = session.term.lock();
                     term.scroll_display(Scroll::Bottom);
@@ -2437,6 +2531,8 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
                 let chrome = st.chrome();
+                // Hit-boxes were rebuilt: the hand cursor follows panel changes under a still mouse.
+                st.update_pointer();
                 let focused = st.focused_id();
                 let (rects, _) = st.tab_layout(st.tabs.active);
                 let frames: Vec<(Frame, (f32, f32))> = rects
@@ -2448,7 +2544,7 @@ impl ApplicationHandler<UserEvent> for App {
                         let term = pane.session.term.lock();
                         let mut frame = Frame::capture(&term, st.window_focused && is_focused, !is_focused || st.cursor_on);
                         let origin = st.grid_origin(*rect);
-                        if is_focused && st.renaming.is_none() {
+                        if is_focused && st.renaming.is_none() && st.search.is_none() {
                             if !st.preedit.is_empty() {
                                 frame.overlay_preedit(&st.preedit);
                             }
@@ -2489,11 +2585,27 @@ impl ApplicationHandler<UserEvent> for App {
         }
         // Only on-screen panes poll git; tell the worker when that set changes.
         let visible = st.tabs.active().root.leaves();
+        // Keys must not go to a find bar that is no longer on screen.
+        if st.search.as_ref().is_some_and(|q| !visible.contains(&q.pane)) {
+            st.toggle_search();
+        }
         if visible != st.visible_sent {
             let _ = st.ctx_tx.send(context::Request::Visible(visible.clone()));
             st.visible_sent = visible;
         }
         // Any structural change (tabs, splits, names, focus, sidebar/panel) schedules a save.
+        // Dock badge: Claude sessions that finished or ask for something, not yet looked at.
+        if st.window_focused {
+            let focused = st.focused_id();
+            if let Some(p) = st.panes.get_mut(&focused) {
+                p.seen = true;
+            }
+        }
+        let waiting = st.panes.values().filter(|p| !p.seen && p.claude.is_some()).count();
+        if waiting != st.badge {
+            st.badge = waiting;
+            dock::set_badge(waiting);
+        }
         let shape = st.snapshot(false);
         if st.saved_shape.as_ref() != Some(&shape) {
             st.saved_shape = Some(shape);

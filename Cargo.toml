@@ -8,6 +8,9 @@ alacritty_terminal = "0.26"
 arboard = "3"
 bytemuck = "1"
 cosmic-text = "0.19"
+# Dock badge; same versions winit already links.
+objc2-app-kit = { version = "0.2.2", features = ["NSApplication", "NSResponder", "NSDockTile"] }
+objc2-foundation = { version = "0.2.2", features = ["NSString"] }
 # Same crate arboard already links; only the decoders the preview needs.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 libc = "0.2"
