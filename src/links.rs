@@ -57,6 +57,15 @@ pub fn image_path_at(line: &str, col: usize) -> Option<String> {
     IMAGE_EXTS.contains(&ext.as_str()).then(|| token.to_string())
 }
 
+/// The repo's open PR/MR list page, from one PR/MR's URL.
+pub fn pr_list_url(pr_url: &str) -> Option<String> {
+    if let Some((base, _)) = pr_url.rsplit_once("/pull/") {
+        return Some(format!("{base}/pulls"));
+    }
+    let (base, _) = pr_url.rsplit_once("/-/merge_requests/")?;
+    Some(format!("{base}/-/merge_requests"))
+}
+
 /// Only web links: terminal output and Claude's text are untrusted, and `open`
 /// would otherwise launch any app registered for a scheme (or run a file:// path).
 pub fn is_web(url: &str) -> bool {
@@ -92,6 +101,13 @@ mod tests {
         assert_eq!(image_path_at(line, 44).as_deref(), Some("img/logo.JPG"));
         assert_eq!(image_path_at(line, 1), None);
         assert_eq!(image_path_at("src/main.rs", 3), None);
+    }
+
+    #[test]
+    fn pr_list_urls() {
+        assert_eq!(pr_list_url("https://github.com/a/b/pull/12").as_deref(), Some("https://github.com/a/b/pulls"));
+        assert_eq!(pr_list_url("https://gl.dev/g/p/-/merge_requests/7").as_deref(), Some("https://gl.dev/g/p/-/merge_requests"));
+        assert_eq!(pr_list_url(""), None);
     }
 
     #[test]
