@@ -756,10 +756,12 @@ impl State {
             context::PrInfo::Found(pr) => Some(pr),
             _ => None,
         };
-        let mut rows: Vec<&context::Pr> = mine.filter(|m| !ctx.open.list.contains(m)).into_iter().collect();
+        // Same PR by number: the branch's copy carries CI, the list's does not.
+        let is_mine = |pr: &context::Pr| mine.is_some_and(|m| m.number == pr.number);
+        let mut rows: Vec<&context::Pr> = mine.filter(|m| !ctx.open.list.iter().any(|p| p.number == m.number)).into_iter().collect();
         for pr in &ctx.open.list {
             if rows.len() < context::PR_LIST_SHOWN {
-                rows.push(pr);
+                rows.push(if is_mine(pr) { mine.unwrap() } else { pr });
             }
         }
         if rows.is_empty() {
@@ -782,8 +784,16 @@ impl State {
             };
             let card_h = 20.0 * s + 24.0 * s + line_h;
             out.push(Chrome::Round { rect: Rect { x: left, y, w: tw, h: card_h }, radius: 12.0 * s, color: CARD });
-            let pw = self.pill(out, left + 12.0 * s, y + 10.0 * s, &format!("{} {}", pr.number, pr.state.label()), color, CARD);
-            if mine == Some(pr) {
+            let mut pw = self.pill(out, left + 12.0 * s, y + 10.0 * s, &format!("{} {}", pr.number, pr.state.label()), color, CARD);
+            if let Some(ci) = pr.ci {
+                let (t, c) = match ci {
+                    context::Ci::Passed => ("✓ CI", SUCCESS),
+                    context::Ci::Failed => ("✗ CI", WARM),
+                    context::Ci::Running => ("● CI", theme::ACCENT),
+                };
+                pw += 6.0 * s + self.pill(out, left + 18.0 * s + pw, y + 10.0 * s, t, c, CARD);
+            }
+            if is_mine(pr) {
                 out.push(label(left + 20.0 * s + pw, y + 13.0 * s, "esta rama".into(), Face::Sans, 11.0 * s, false, theme::MUTED, tw - pw - 32.0 * s));
             }
             if links::is_web(&pr.url) {
