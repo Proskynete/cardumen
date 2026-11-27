@@ -1971,7 +1971,9 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
-        let Some(st) = self.state.as_mut() else { return };
+        // The last tab just closed and the app is quitting: events still queued
+        // (a redraw, a mouse move) must not look up the active tab.
+        let Some(st) = self.state.as_mut().filter(|st| !st.tabs.list.is_empty()) else { return };
         let (id, event) = match event {
             UserEvent::Term(id, event) => (id, event),
             UserEvent::Preview(path, img) => {
@@ -2083,7 +2085,9 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        let Some(st) = self.state.as_mut() else { return };
+        // The last tab just closed and the app is quitting: events still queued
+        // (a redraw, a mouse move) must not look up the active tab.
+        let Some(st) = self.state.as_mut().filter(|st| !st.tabs.list.is_empty()) else { return };
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
