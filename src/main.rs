@@ -178,6 +178,8 @@ struct State {
     ctx_tx: std::sync::mpsc::Sender<context::Request>,
     /// Last seen structure (without directories) and when to save it.
     saved_shape: Option<session_file::Saved>,
+    /// Panes last reported on screen to the context worker.
+    visible_sent: Vec<PaneId>,
     save_at: Option<Instant>,
 }
 
@@ -1958,6 +1960,7 @@ impl ApplicationHandler<UserEvent> for App {
                 context::spawn(move |u| proxy.send_event(UserEvent::Context(u)).is_ok(), session::cwd_of)
             },
             saved_shape: None,
+            visible_sent: vec![],
             save_at: None,
         };
         if !st.restore_session() {
@@ -2483,6 +2486,12 @@ impl ApplicationHandler<UserEvent> for App {
             if st.sidebar && st.panes.values().any(|p| p.claude.is_some()) {
                 st.window.request_redraw();
             }
+        }
+        // Only on-screen panes poll git; tell the worker when that set changes.
+        let visible = st.tabs.active().root.leaves();
+        if visible != st.visible_sent {
+            let _ = st.ctx_tx.send(context::Request::Visible(visible.clone()));
+            st.visible_sent = visible;
         }
         // Any structural change (tabs, splits, names, focus, sidebar/panel) schedules a save.
         let shape = st.snapshot(false);
