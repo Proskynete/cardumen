@@ -101,6 +101,20 @@ impl Frame {
         }
         Self { cells, cursor }
     }
+
+    /// Draws IME composition text (e.g. a pending `´`) underlined at the cursor.
+    /// shortcut: one cell per char, wide (CJK) preedit overlaps; upgrade with unicode-width if needed.
+    pub fn overlay_preedit(&mut self, text: &str) {
+        let Some(cursor) = self.cursor.as_mut() else { return };
+        let (col, line) = (cursor.col, cursor.line);
+        let n = text.chars().count();
+        self.cells.retain(|c| c.line != line || c.col < col || c.col >= col + n);
+        for (i, c) in text.chars().enumerate() {
+            let (fg, bg, flags) = (theme::FOREGROUND, theme::BACKGROUND, Flags::UNDERLINE);
+            self.cells.push(CellDraw { col: col + i, line, c, fg, bg, flags });
+        }
+        cursor.col += n;
+    }
 }
 
 pub struct Renderer {
@@ -489,5 +503,22 @@ impl Renderer {
         self.queue.submit([encoder.finish()]);
         self.queue.present(output);
         self.atlas_reset
+    }
+}
+
+#[cfg(test)]
+mod preedit_tests {
+    use super::*;
+
+    #[test]
+    fn preedit_replaces_cells_and_moves_cursor() {
+        let cell = |col, c| CellDraw { col, line: 0, c, fg: theme::FOREGROUND, bg: theme::BACKGROUND, flags: Flags::empty() };
+        let cursor = CursorDraw { col: 1, line: 0, shape: CursorShape::Block, color: theme::ACCENT };
+        let mut f = Frame { cells: vec![cell(0, 'a'), cell(1, 'b'), cell(2, 'c')], cursor: Some(cursor) };
+        f.overlay_preedit("´");
+        let mut got: Vec<_> = f.cells.iter().map(|c| (c.col, c.c, c.flags.contains(Flags::UNDERLINE))).collect();
+        got.sort();
+        assert_eq!(got, [(0, 'a', false), (1, '´', true), (2, 'c', false)]);
+        assert_eq!(f.cursor.unwrap().col, 2);
     }
 }
