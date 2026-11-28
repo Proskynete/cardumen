@@ -199,9 +199,19 @@ mod tests {
         WindowSize { num_cols: cols, num_lines: lines, cell_width: 8, cell_height: 16 }
     }
 
+    /// The user's dotfiles (oh-my-zsh, prompts, plugins) make each login shell take
+    /// seconds and timing-dependent; tests run zsh with an empty `.zshrc` instead.
+    /// The file must exist, or zsh opens its new-user wizard and eats the input.
+    fn plain_shell() -> Vec<(String, String)> {
+        let dir = std::env::temp_dir().join(format!("cardumen-test-zdotdir-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".zshrc"), "").unwrap();
+        vec![("ZDOTDIR".into(), dir.to_string_lossy().into_owned())]
+    }
+
     fn start(cols: u16) -> (Session<Probe>, mpsc::Receiver<String>) {
         let (tx, rx) = mpsc::channel();
-        let s = Session::spawn(size(cols, 24), 1000, Probe(tx), Some("BANNER\r\n".into()), None, vec![]).unwrap();
+        let s = Session::spawn(size(cols, 24), 1000, Probe(tx), Some("BANNER\r\n".into()), None, plain_shell()).unwrap();
         (s, rx)
     }
 
@@ -293,7 +303,7 @@ mod tests {
     #[test]
     fn starts_in_cwd_and_tracks_cd() {
         let (tx, _rx) = mpsc::channel();
-        let s = Session::spawn(size(80, 24), 100, Probe(tx), None, Some("/usr".into()), vec![]).unwrap();
+        let s = Session::spawn(size(80, 24), 100, Probe(tx), None, Some("/usr".into()), plain_shell()).unwrap();
         ready(&s);
         assert_eq!(s.cwd().unwrap(), PathBuf::from("/usr"));
         s.write(b"cd /tmp\r".to_vec());

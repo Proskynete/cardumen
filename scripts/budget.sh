@@ -35,24 +35,37 @@ $(tab cinco "$(pane e)")
 ]}
 JSON
 
-CARDUMEN_SESSION="$tmp/session.json" CARDUMEN_STARTUP_LOG=1 target/release/cardumen 2>"$tmp/stderr" &
-pid=$!
+# Start Cardumen and wait for its first frame; sets $pid and $first.
+launch() {
+  CARDUMEN_SESSION="$tmp/session.json" CARDUMEN_STARTUP_LOG=1 target/release/cardumen 2>"$tmp/stderr" &
+  pid=$!
+  first=""
+  for _ in $(seq 100); do
+    first="$(sed -n 's/^first frame: //p' "$tmp/stderr")"
+    [ -n "$first" ] && return
+    sleep 0.1
+  done
+  echo "no first frame after 10 s"; cat "$tmp/stderr"; exit 1
+}
 
-first=""
-for _ in $(seq 100); do
-  first="$(sed -n 's/^first frame: //p' "$tmp/stderr")"
-  [ -n "$first" ] && break
-  sleep 0.1
-done
-[ -n "$first" ] || { echo "no first frame after 10 s"; cat "$tmp/stderr"; exit 1; }
+# Warm-up launch, not measured: the first run of a freshly built binary pays for
+# macOS checking it and loading fonts cold (~0.5-1 s), which a daily launch does not.
+launch
+kill "$pid"; wait "$pid" 2>/dev/null || true
+launch
 
 sleep "$SETTLE_S"
 rss_max=0
 cpu_sum=0
 for _ in $(seq "$SAMPLES"); do
-  read -r rss cpu < <(ps -o rss=,%cpu= -p "$pid")
-  [ "$rss" -gt "$rss_max" ] && rss_max=$rss
-  cpu_sum=$(echo "$cpu_sum + $cpu" | bc -l)
+  # Physical footprint (what Activity Monitor shows), not RSS: RSS swings with
+  # shared and GPU-mapped pages and with memory pressure.
+  mem=$(vmmap --summary "$pid" 2>/dev/null | awk '/^Physical footprint:/ {
+    v = $3; u = substr(v, length(v)); v += 0
+    print (u == "G" ? v * 1024 * 1024 : u == "M" ? v * 1024 : v) }')
+  [ -n "$mem" ] || { echo "vmmap could not read the process"; exit 1; }
+  [ "$(echo "$mem > $rss_max" | bc -l)" = 1 ] && rss_max=$mem
+  cpu_sum=$(echo "$cpu_sum + $(ps -o %cpu= -p "$pid")" | bc -l)
   sleep 1
 done
 rss_mb=$(echo "scale=1; $rss_max / 1024" | bc -l)

@@ -4,9 +4,9 @@
 
 ## What Changes
 
-- `scripts/budget.sh`: builds release, launches Cardumen with a fixed 5-tab session in a throwaway session file, measures time to first frame, resident memory and idle CPU, prints them, and exits non-zero when one is over budget.
+- `scripts/budget.sh`: builds release, launches Cardumen with a fixed 5-tab session in a throwaway session file, measures time to first frame, physical footprint and idle CPU, prints them, and exits non-zero when one is over budget.
 - Two environment variables, used only by the script: `CARDUMEN_SESSION` (session file path instead of the real one) and `CARDUMEN_STARTUP_LOG` (print time to first frame to stderr).
-- Budgets: first frame ≤ 300 ms, RSS ≤ 60 MB, average idle CPU ≤ 0.5%.
+- Budgets: first frame ≤ 300 ms, memory (physical footprint) ≤ 60 MB, average idle CPU ≤ 0.5%.
 
 ## Capabilities
 
