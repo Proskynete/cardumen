@@ -16,6 +16,7 @@ mod status;
 mod theme;
 mod usage;
 mod welcome;
+mod worktree;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -116,6 +117,18 @@ struct Switcher {
     sel: usize,
     /// Row hit-boxes from the last draw, in item order.
     rows: Vec<Rect>,
+    /// Main checkout of the focused pane's repo and its active OpenSpec changes, read on open.
+    repo: Option<PathBuf>,
+    changes: Vec<String>,
+    /// A change being started, and git's error if it failed.
+    starting: Option<(String, Option<String>)>,
+}
+
+#[derive(Clone)]
+enum Target {
+    Tab(usize),
+    /// An OpenSpec change with no tab yet: start it in its worktree.
+    Change(String),
 }
 
 /// A quick-switcher row.
@@ -123,7 +136,7 @@ struct SwitchItem {
     title: String,
     project: String,
     waiting: bool,
-    tab: usize,
+    target: Target,
 }
 
 const SWITCHER_ROWS: usize = 8;
@@ -204,6 +217,8 @@ struct State {
     /// Multi-line paste waiting for Enter, since the app did not enable bracketed paste: (pane, text, lines).
     pending_paste: Option<(PaneId, String, usize)>,
     switcher: Option<Switcher>,
+    /// Commands to type into new panes once their shell is ready (or after a few seconds).
+    startup: Vec<(PaneId, String, Instant)>,
     /// Number shown on the Dock icon.
     badge: usize,
     diff: Option<DiffView>,
@@ -1429,7 +1444,9 @@ impl State {
         self.switcher = match self.switcher.take() {
             None if self.diff.is_none() && !self.usage_open => {
                 let sel = if self.tabs.active < SWITCHER_ROWS { self.tabs.active } else { 0 };
-                Some(Switcher { query: String::new(), sel, rows: vec![] })
+                let repo = self.focused().session.cwd().and_then(|d| worktree::main_root(&d));
+                let changes = repo.as_deref().map(worktree::changes).unwrap_or_default();
+                Some(Switcher { query: String::new(), sel, rows: vec![], repo, changes, starting: None })
             }
             _ => None,
         };
@@ -1445,18 +1462,69 @@ impl State {
                 let tab = &self.tabs.list[i];
                 let (title, project) = (self.tab_title(i), project_name(self.panes.get(&tab.focused).and_then(|p| p.session.cwd())));
                 let score = fuzzy::score(query, &format!("{title} {project}"))?;
-                Some((score, SwitchItem { title, project, waiting: tab.root.leaves().iter().any(waiting), tab: i }))
+                Some((score, SwitchItem { title, project, waiting: tab.root.leaves().iter().any(waiting), target: Target::Tab(i) }))
             })
             .collect();
         scored.sort_by_key(|(score, _)| -score);
+        // Then changes not open in any pane yet.
+        if let Some((repo, sw)) = self.switcher.as_ref().and_then(|sw| Some((sw.repo.as_ref()?, sw))) {
+            let cwds: Vec<PathBuf> = self.panes.values().filter_map(|p| p.session.cwd()).collect();
+            let project = folder_name(Some(repo.clone()));
+            let mut new: Vec<(i32, SwitchItem)> = sw
+                .changes
+                .iter()
+                .filter(|c| !cwds.iter().any(|d| d.starts_with(worktree::path(repo, c))))
+                .filter_map(|c| {
+                    let title = format!("Nuevo · {c}");
+                    let score = fuzzy::score(query, &format!("{title} {project}"))?;
+                    Some((score, SwitchItem { title, project: project.clone(), waiting: false, target: Target::Change(c.clone()) }))
+                })
+                .collect();
+            new.sort_by_key(|(score, _)| -score);
+            scored.extend(new);
+        }
         scored.into_iter().map(|(_, item)| item).take(SWITCHER_ROWS).collect()
+    }
+
+    /// Create or reuse the change's worktree off the UI thread; `UserEvent::Worktree` opens its tab.
+    fn start_change(&mut self, change: String) {
+        let Some(sw) = self.switcher.as_mut() else { return };
+        let Some(repo) = sw.repo.clone() else { return };
+        if sw.starting.as_ref().is_some_and(|(c, err)| *c == change && err.is_none()) {
+            return;
+        }
+        sw.starting = Some((change.clone(), None));
+        let proxy = self.proxy.clone();
+        let _ = std::thread::Builder::new().name("worktree".into()).spawn(move || {
+            let result = worktree::ensure(&repo, &change);
+            let _ = proxy.send_event(UserEvent::Worktree(change, result));
+        });
+    }
+
+    /// A new tab in `dir` named `name` that runs `command` once its shell is ready.
+    fn open_tab_running(&mut self, dir: PathBuf, name: String, command: &str) {
+        let id = self.take_id();
+        self.tabs.open(id);
+        if !self.spawn_pane(id, false, Some(dir)) {
+            self.tabs.remove_pane(id);
+            self.relayout();
+            return;
+        }
+        self.tabs.active_mut().name = Some(name);
+        self.startup.push((id, format!("{command}\r"), Instant::now() + Duration::from_secs(5)));
+        self.relayout();
+        self.after_tab_change();
     }
 
     /// Open row `i` of the switcher (if it exists) and close it.
     fn switcher_open(&mut self, i: usize) {
-        if let Some(item) = self.switcher_items().into_iter().nth(i) {
-            self.switcher = None;
-            self.jump_to(self.tabs.list[item.tab].focused);
+        match self.switcher_items().into_iter().nth(i).map(|item| item.target) {
+            Some(Target::Tab(tab)) => {
+                self.switcher = None;
+                self.jump_to(self.tabs.list[tab].focused);
+            }
+            Some(Target::Change(change)) => self.start_change(change),
+            None => {}
         }
     }
 
@@ -1511,15 +1579,16 @@ impl State {
         out.push(Chrome::Round { rect: Rect { x: x - s, y: y - s, w: w + 2.0 * s, h: h + 2.0 * s }, radius: 13.0 * s, color: HAIRLINE });
         out.push(Chrome::Round { rect: Rect { x, y, w, h }, radius: 12.0 * s, color: PANEL });
         let px = 13.5 * s;
-        let sw = self.switcher.as_ref().unwrap();
-        let (text, color) = if sw.query.is_empty() && self.preedit.is_empty() {
+        let Some(sw) = self.switcher.as_ref() else { return out };
+        let (query, sel, starting) = (sw.query.clone(), sw.sel, sw.starting.clone());
+        let (text, color) = if query.is_empty() && self.preedit.is_empty() {
             ("Ir a una pestaña…".to_string(), theme::MUTED)
         } else {
-            (format!("{}{}", sw.query, self.preedit), theme::FOREGROUND)
+            (format!("{query}{}", self.preedit), theme::FOREGROUND)
         };
         out.push(label(x + 16.0 * s, y + (field_h - px * 1.3) / 2.0, text, Face::Sans, px, false, color, w - 32.0 * s));
         out.push(Chrome::Rect { rect: Rect { x, y: y + field_h, w, h: s }, color: HAIRLINE });
-        let sel = sw.sel.min(items.len().saturating_sub(1));
+        let sel = sel.min(items.len().saturating_sub(1));
         let mut rows = vec![];
         let mut ry = y + field_h + 6.0 * s;
         if items.is_empty() {
@@ -1535,9 +1604,15 @@ impl State {
                 let d = 7.0 * s;
                 out.push(Chrome::Round { rect: Rect { x: x + 16.0 * s, y: ry + (row_h - d) / 2.0, w: d, h: d }, radius: d / 2.0, color: WARM });
             }
-            let pw = self.fonts.run(&item.project, Face::Sans, 12.0 * s, false).width.min(w * 0.4);
+            // A change being started shows "creando…" or git's error instead of the project.
+            let note = match (&item.target, &starting) {
+                (Target::Change(c), Some((sc, err))) if c == sc => Some(err.clone().map_or(("creando…".to_string(), theme::MUTED), |e| (e, WARM))),
+                _ => None,
+            };
+            let (right, rcolor) = note.unwrap_or((item.project.clone(), theme::MUTED));
+            let pw = self.fonts.run(&right, Face::Sans, 12.0 * s, false).width.min(w * 0.5);
             out.push(label(x + 30.0 * s, ty, item.title.clone(), Face::Sans, px, i == sel, theme::FOREGROUND, w - pw - 60.0 * s));
-            out.push(label(x + w - 16.0 * s - pw, ty + s, item.project.clone(), Face::Sans, 12.0 * s, false, theme::MUTED, pw + s));
+            out.push(label(x + w - 16.0 * s - pw, ty + s, right, Face::Sans, 12.0 * s, false, rcolor, pw + s));
             rows.push(row);
             ry += row_h;
         }
@@ -2210,6 +2285,7 @@ impl ApplicationHandler<UserEvent> for App {
             search: None,
             pending_paste: None,
             switcher: None,
+            startup: vec![],
             badge: 0,
             diff: None,
             ctx_tx: {
@@ -2236,6 +2312,24 @@ impl ApplicationHandler<UserEvent> for App {
         let Some(st) = self.state.as_mut().filter(|st| !st.tabs.list.is_empty()) else { return };
         let (id, event) = match event {
             UserEvent::Term(id, event) => (id, event),
+            UserEvent::Worktree(change, result) => {
+                let mine = st.switcher.as_ref().is_some_and(|sw| sw.starting.as_ref().is_some_and(|(c, _)| *c == change));
+                match result {
+                    Ok(dir) => {
+                        if mine {
+                            st.switcher = None;
+                        }
+                        st.open_tab_running(dir, change, "claude");
+                    }
+                    Err(e) => {
+                        if let Some(sw) = st.switcher.as_mut().filter(|_| mine) {
+                            sw.starting = Some((change, Some(e)));
+                        }
+                        st.window.request_redraw();
+                    }
+                }
+                return;
+            }
             UserEvent::Preview(path, img) => {
                 if let (Some(p), Some((w, h, rgba))) = (st.preview.as_mut().filter(|p| p.path == path), img) {
                     p.size = Some((w, h));
@@ -2810,6 +2904,18 @@ impl ApplicationHandler<UserEvent> for App {
             if st.sidebar && st.panes.values().any(|p| p.claude.is_some()) {
                 st.window.request_redraw();
             }
+        }
+        // New change tabs: type `claude` once zsh is at its prompt (it turns on bracketed paste there).
+        if !st.startup.is_empty() {
+            let panes = &st.panes;
+            st.startup.retain(|(id, cmd, deadline)| {
+                let Some(p) = panes.get(id) else { return false };
+                let ready = p.session.term.lock().mode().contains(TermMode::BRACKETED_PASTE) || now >= *deadline;
+                if ready {
+                    p.session.write(cmd.clone().into_bytes());
+                }
+                !ready
+            });
         }
         // Only on-screen panes poll git; tell the worker when that set changes.
         let visible = st.tabs.active().root.leaves();

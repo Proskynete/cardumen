@@ -25,6 +25,8 @@ pub enum UserEvent {
     Diff(std::path::PathBuf, Box<crate::diff::Diff>),
     /// A decoded image preview (`w`, `h`, RGBA), or `None` when it could not be read.
     Preview(std::path::PathBuf, Option<(u32, u32, Vec<u8>)>),
+    /// `worktree::ensure` finished for this change: its directory, or git's error.
+    Worktree(String, Result<std::path::PathBuf, String>),
 }
 
 #[derive(Clone)]
