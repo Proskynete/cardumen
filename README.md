@@ -26,6 +26,7 @@ Usé Warp durante años, pero cada vez pesaba más (cerca de 1 GB de RAM), traí
 ## Liviana y privada
 
 - ~45 MB de memoria con varias sesiones abiertas, 0% de CPU en reposo (Apple M1, 8 GB).
+- `scripts/budget.sh` lo comprueba: abre Cardumen con 5 pestañas de prueba (sin tocar tu sesión) y falla si el primer frame pasa de 300 ms, la memoria de 60 MB o la CPU en reposo de 0.5%.
 - Sin telemetría ni red. Lo único que sale de tu máquina son las consultas de PR/MR que hace `gh`/`glab`, cada 2 minutos por rama.
 - El trabajo pesado (git, transcripts) corre en threads aparte; el panel de uso lee 3.6 GB de transcripts la primera vez (~5 s) y después solo lo nuevo (~30 ms).
 

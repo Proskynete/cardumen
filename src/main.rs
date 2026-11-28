@@ -243,6 +243,8 @@ struct App {
     config: Config,
     proxy: EventLoopProxy<UserEvent>,
     state: Option<State>,
+    /// Launch time while `CARDUMEN_STARTUP_LOG` asks for the first-frame time; cleared once printed.
+    startup_log: Option<Instant>,
 }
 
 impl State {
@@ -2885,6 +2887,9 @@ impl ApplicationHandler<UserEvent> for App {
                 if st.renderer.render(&refs, &chrome, &overlay, &mut st.fonts, GUTTER, preview) || st.animating {
                     st.window.request_redraw();
                 }
+                if let Some(t) = self.startup_log.take() {
+                    eprintln!("first frame: {}", t.elapsed().as_millis());
+                }
             }
             _ => {}
         }
@@ -3095,6 +3100,7 @@ fn log_panics() {
 }
 
 fn main() {
+    let started = Instant::now();
     log_panics();
     let config = config::load();
     let event_loop = EventLoop::<UserEvent>::with_user_event().build().expect("event loop");
@@ -3103,7 +3109,8 @@ fn main() {
     if let Err(e) = status::listen(socket.clone(), proxy.clone()) {
         eprintln!("cardumen: status socket unavailable ({e}); the sidebar will not show Claude Code states");
     }
-    let mut app = App { socket: socket.clone(), config, proxy, state: None };
+    let startup_log = std::env::var_os("CARDUMEN_STARTUP_LOG").map(|_| started);
+    let mut app = App { socket: socket.clone(), config, proxy, state: None, startup_log };
     event_loop.run_app(&mut app).expect("run");
     let _ = std::fs::remove_file(socket);
 }

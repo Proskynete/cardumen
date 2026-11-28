@@ -35,9 +35,14 @@ pub enum SavedNode {
     Split { dir: Dir, children: Vec<SavedNode> },
 }
 
-/// `~/Library/Application Support/cardumen/session.json`.
+/// `~/Library/Application Support/cardumen/session.json`, or `CARDUMEN_SESSION` when set
+/// (`scripts/budget.sh` uses a throwaway session).
 pub fn path() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Application Support/cardumen/session.json"))
+    path_from(std::env::var_os("CARDUMEN_SESSION"), std::env::var_os("HOME"))
+}
+
+fn path_from(session: Option<std::ffi::OsString>, home: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    session.filter(|s| !s.is_empty()).map(PathBuf::from).or_else(|| home.map(|h| PathBuf::from(h).join("Library/Application Support/cardumen/session.json")))
 }
 
 pub fn capture(tabs: &Tabs, cwd: impl Fn(PaneId) -> Option<PathBuf>, sidebar: bool, panel: bool) -> Saved {
@@ -127,6 +132,14 @@ pub fn store(path: &Path, saved: &Saved) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_path_override() {
+        let home = Some("/Users/a".into());
+        assert_eq!(path_from(Some("/tmp/x/s.json".into()), home.clone()), Some(PathBuf::from("/tmp/x/s.json")));
+        assert_eq!(path_from(None, home.clone()), Some(PathBuf::from("/Users/a/Library/Application Support/cardumen/session.json")));
+        assert_eq!(path_from(Some("".into()), home), Some(PathBuf::from("/Users/a/Library/Application Support/cardumen/session.json")));
+    }
 
     fn sample() -> Tabs {
         let mut t = Tabs::default();
