@@ -57,6 +57,8 @@ Para desarrollo: `cargo run --release`.
 | Cmd+Shift+[ / ], Ctrl+Tab | pestaña anterior / siguiente |
 | Arrastrar, Cmd+Shift+←/→ | mover la pestaña |
 | Doble clic, Cmd+Shift+R | renombrar la pestaña |
+| Cmd+J | ir a la sesión que te espera (otra vez: la siguiente) |
+| Cmd+P | ir a una pestaña escribiendo parte de su nombre o proyecto |
 | Cmd+B | mostrar / ocultar el sidebar de sesiones |
 | Cmd+I | mostrar / ocultar el panel Resumen |
 | Cmd+G | ver el diff completo |

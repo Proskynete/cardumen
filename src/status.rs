@@ -64,6 +64,14 @@ pub fn elapsed(since: Instant) -> String {
     }
 }
 
+/// Cmd+J target: waiting panes from longest-waiting to newest; the one after
+/// `focused` in that order (wrapping), or the first when `focused` is not waiting.
+pub fn next_waiting(mut waiting: Vec<(PaneId, Instant)>, focused: PaneId) -> Option<PaneId> {
+    waiting.sort_by_key(|&(id, since)| (since, id));
+    let next = waiting.iter().position(|w| w.0 == focused).map_or(0, |i| (i + 1) % waiting.len());
+    waiting.get(next).map(|w| w.0)
+}
+
 pub fn socket_path() -> PathBuf {
     std::env::temp_dir().join(format!("cardumen-{}.sock", std::process::id()))
 }
@@ -96,6 +104,17 @@ fn serve(path: PathBuf, on_event: impl Fn(PaneId, Option<Claude>, Hook) -> bool 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn next_waiting_cycles_oldest_first() {
+        let now = Instant::now();
+        let (old, new) = (now - std::time::Duration::from_secs(300), now - std::time::Duration::from_secs(60));
+        let w = || vec![(2, new), (5, old)];
+        assert_eq!(next_waiting(w(), 9), Some(5));
+        assert_eq!(next_waiting(w(), 5), Some(2));
+        assert_eq!(next_waiting(w(), 2), Some(5));
+        assert_eq!(next_waiting(vec![], 1), None);
+    }
 
     #[test]
     fn parses_lines() {
