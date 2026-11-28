@@ -134,6 +134,12 @@ pub fn shell_escape(path: &str) -> String {
     out
 }
 
+/// Lines of a paste that would run one by one: the app has no bracketed paste
+/// and the text has a line break. `None` means it can be sent at once.
+pub fn unprotected_lines(text: &str, bracketed: bool) -> Option<usize> {
+    (!bracketed && text.contains(['\n', '\r'])).then(|| text.lines().count().max(1))
+}
+
 pub enum Edit {
     Continue,
     Commit,
@@ -164,6 +170,15 @@ pub fn edit_line(buf: &mut String, key: &Key, text: Option<&str>, mods: Modifier
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unprotected_paste() {
+        assert_eq!(unprotected_lines("a\nb\nc", true), None);
+        assert_eq!(unprotected_lines("git status", false), None);
+        assert_eq!(unprotected_lines("git status\n", false), Some(1));
+        assert_eq!(unprotected_lines("a\r\nb", false), Some(2));
+        assert_eq!(unprotected_lines("a\nb\nc", false), Some(3));
+    }
 
     fn ch(s: &str) -> Key {
         Key::Character(s.into())
