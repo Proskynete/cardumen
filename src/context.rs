@@ -48,6 +48,38 @@ pub struct Pr {
     pub state: PrState,
     /// Web page of the PR/MR; empty when the CLI did not report one.
     pub url: String,
+    /// CI of the branch's PR/MR only; list items leave it `None`.
+    pub ci: Option<Ci>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Ci {
+    Passed,
+    Failed,
+    Running,
+}
+
+/// GitHub `statusCheckRollup`: any failure wins, then anything unfinished; empty is no CI.
+fn gh_ci(rollup: &Value) -> Option<Ci> {
+    let checks = rollup.as_array().filter(|a| !a.is_empty())?;
+    let state = |c: &Value| match (c["status"].as_str(), c["conclusion"].as_str(), c["state"].as_str()) {
+        (_, Some("FAILURE" | "TIMED_OUT" | "CANCELLED" | "ACTION_REQUIRED" | "STARTUP_FAILURE"), _) | (_, _, Some("FAILURE" | "ERROR")) => Ci::Failed,
+        (_, _, Some("PENDING" | "EXPECTED")) => Ci::Running,
+        (Some(st), ..) if st != "COMPLETED" => Ci::Running,
+        _ => Ci::Passed,
+    };
+    let all: Vec<Ci> = checks.iter().map(state).collect();
+    [Ci::Failed, Ci::Running].into_iter().find(|c| all.contains(c)).or(Some(Ci::Passed))
+}
+
+/// GitLab `head_pipeline.status`; skipped, manual or missing is no CI.
+fn glab_ci(mr: &Value) -> Option<Ci> {
+    match mr["head_pipeline"]["status"].as_str()? {
+        "success" => Some(Ci::Passed),
+        "failed" | "canceled" => Some(Ci::Failed),
+        "running" | "pending" | "created" | "preparing" | "waiting_for_resource" | "scheduled" => Some(Ci::Running),
+        _ => None,
+    }
 }
 
 /// Open PRs/MRs of the repository: the newest few, plus how many there are.
@@ -244,12 +276,16 @@ pub fn parse_numstat(out: &str) -> Changes {
     c
 }
 
+/// The branch's PR, with its CI.
 pub fn parse_gh(json: &str) -> Option<Pr> {
-    gh_pr(&serde_json::from_str(json).ok()?)
+    let v: Value = serde_json::from_str(json).ok()?;
+    Some(Pr { ci: gh_ci(&v["statusCheckRollup"]), ..gh_pr(&v)? })
 }
 
+/// The branch's MR, with its CI.
 pub fn parse_glab(json: &str) -> Option<Pr> {
-    glab_mr(&serde_json::from_str(json).ok()?)
+    let v: Value = serde_json::from_str(json).ok()?;
+    Some(Pr { ci: glab_ci(&v), ..glab_mr(&v)? })
 }
 
 /// A `gh pr list` / `glab mr list` JSON array: the newest `PR_LIST_SHOWN` and the count.
@@ -269,7 +305,7 @@ fn gh_pr(v: &Value) -> Option<Pr> {
         (_, _, Some("CHANGES_REQUESTED")) => PrState::ChangesRequested,
         _ => PrState::Open,
     };
-    Some(Pr { number: format!("#{}", v["number"].as_u64()?), title: v["title"].as_str()?.to_string(), state, url: v["url"].as_str().unwrap_or_default().into() })
+    Some(Pr { number: format!("#{}", v["number"].as_u64()?), title: v["title"].as_str()?.to_string(), state, url: v["url"].as_str().unwrap_or_default().into(), ci: None })
 }
 
 fn glab_mr(v: &Value) -> Option<Pr> {
@@ -280,7 +316,7 @@ fn glab_mr(v: &Value) -> Option<Pr> {
         _ if draft => PrState::Draft,
         _ => PrState::Open,
     };
-    Some(Pr { number: format!("!{}", v["iid"].as_u64()?), title: v["title"].as_str()?.to_string(), state, url: v["web_url"].as_str().unwrap_or_default().into() })
+    Some(Pr { number: format!("!{}", v["iid"].as_u64()?), title: v["title"].as_str()?.to_string(), state, url: v["web_url"].as_str().unwrap_or_default().into(), ci: None })
 }
 
 /// One line for a permission request: tool plus its main argument.
@@ -394,7 +430,7 @@ fn pull_request(repo: &Path, provider: Option<Provider>) -> PrInfo {
     let timeout = Duration::from_secs(15);
     match provider {
         Some(Provider::GitHub) => {
-            match run("gh", &["pr", "view", "--json", "number,title,state,isDraft,reviewDecision,url"], repo, timeout) {
+            match run("gh", &["pr", "view", "--json", "number,title,state,isDraft,reviewDecision,url,statusCheckRollup"], repo, timeout) {
                 Ok(json) => parse_gh(&json).map_or(PrInfo::Error("respuesta de gh no válida".into()), PrInfo::Found),
                 Err(e) if e.contains("no pull requests found") => PrInfo::None,
                 Err(e) => PrInfo::Error(e),
@@ -554,7 +590,7 @@ mod tests {
     }
 
     fn pr(state: PrState) -> PrInfo {
-        PrInfo::Found(Pr { number: "#1".into(), title: "t".into(), state, url: String::new() })
+        PrInfo::Found(Pr { number: "#1".into(), title: "t".into(), state, url: String::new(), ci: None })
     }
 
     #[test]
@@ -639,10 +675,33 @@ mod tests {
     }
 
     #[test]
+    fn ci_state() {
+        let gh = |rollup: &str| parse_gh(&format!(r#"{{"number":1,"title":"t","state":"OPEN","statusCheckRollup":{rollup}}}"#)).unwrap().ci;
+        let run = |status: &str, conclusion: &str| format!(r#"{{"__typename":"CheckRun","status":"{status}","conclusion":"{conclusion}"}}"#);
+        let (ok, bad, busy) = (run("COMPLETED", "SUCCESS"), run("COMPLETED", "FAILURE"), run("IN_PROGRESS", ""));
+        assert_eq!(gh(&format!("[{ok},{bad},{busy}]")), Some(Ci::Failed));
+        assert_eq!(gh(&format!("[{ok},{busy}]")), Some(Ci::Running));
+        assert_eq!(gh(&format!(r#"[{ok},{},{{"__typename":"StatusContext","state":"SUCCESS"}}]"#, run("COMPLETED", "SKIPPED"))), Some(Ci::Passed));
+        assert_eq!(gh(r#"[{"__typename":"StatusContext","state":"PENDING"}]"#), Some(Ci::Running));
+        assert_eq!(gh(r#"[{"__typename":"StatusContext","state":"ERROR"}]"#), Some(Ci::Failed));
+        assert_eq!(gh("[]"), None);
+        assert_eq!(parse_gh(r#"{"number":1,"title":"t","state":"OPEN"}"#).unwrap().ci, None);
+        let gl = |status: &str| parse_glab(&format!(r#"{{"iid":1,"title":"t","state":"opened","head_pipeline":{{"status":"{status}"}}}}"#)).unwrap().ci;
+        assert_eq!(gl("running"), Some(Ci::Running));
+        assert_eq!(gl("failed"), Some(Ci::Failed));
+        assert_eq!(gl("success"), Some(Ci::Passed));
+        assert_eq!(gl("manual"), None);
+        assert_eq!(parse_glab(r#"{"iid":1,"title":"t","state":"opened"}"#).unwrap().ci, None);
+        // The open list never carries CI.
+        let list = parse_list(&format!(r#"[{{"number":1,"title":"t","state":"OPEN","statusCheckRollup":[{bad}]}}]"#), gh_pr).unwrap();
+        assert_eq!(list.list[0].ci, None);
+    }
+
+    #[test]
     fn pr_json() {
         let gh = r#"{"isDraft":false,"number":42,"reviewDecision":"CHANGES_REQUESTED","state":"OPEN","title":"Add panel","url":"https://github.com/a/b/pull/42"}"#;
         let url = "https://github.com/a/b/pull/42".to_string();
-        assert_eq!(parse_gh(gh).unwrap(), Pr { number: "#42".into(), title: "Add panel".into(), state: PrState::ChangesRequested, url });
+        assert_eq!(parse_gh(gh).unwrap(), Pr { number: "#42".into(), title: "Add panel".into(), state: PrState::ChangesRequested, url, ci: None });
         let gh = r#"{"isDraft":true,"number":7,"reviewDecision":"","state":"OPEN","title":"wip"}"#;
         assert_eq!(parse_gh(gh).unwrap().state, PrState::Draft);
         let gl = r#"{"iid":17,"title":"Fix","state":"opened","draft":false,"web_url":"https://gl.dev/a/-/merge_requests/17"}"#;
